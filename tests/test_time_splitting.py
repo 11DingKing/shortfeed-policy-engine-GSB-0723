@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 import pytz
 
@@ -9,8 +9,9 @@ from app.infrastructure.repositories.session_repo import split_seconds_by_local_
 
 def test_split_no_midnight_crossing():
     tz = "Asia/Shanghai"
-    start = datetime(2026, 7, 24, 14, 0, 0, tzinfo=pytz.timezone(tz))
-    end = datetime(2026, 7, 24, 14, 5, 0, tzinfo=pytz.timezone(tz))
+    sh = pytz.timezone(tz)
+    start = sh.localize(datetime(2026, 7, 24, 14, 0, 0))
+    end = sh.localize(datetime(2026, 7, 24, 14, 5, 0))
     result = split_seconds_by_local_day(start, end, tz)
     assert len(result) == 1
     d = list(result.keys())[0]
@@ -21,19 +22,19 @@ def test_split_no_midnight_crossing():
 def test_split_crosses_midnight():
     tz = "Asia/Shanghai"
     sh = pytz.timezone(tz)
-    start = datetime(2026, 7, 24, 23, 58, 0, tzinfo=sh)
-    end = datetime(2026, 7, 25, 0, 2, 0, tzinfo=sh)
+    start = sh.localize(datetime(2026, 7, 24, 23, 58, 0))
+    end = sh.localize(datetime(2026, 7, 25, 0, 2, 0))
     result = split_seconds_by_local_day(start, end, tz)
-    assert len(result) == 2
-    assert result[datetime(2026, 7, 24).date()] == 120
-    assert result[datetime(2026, 7, 25).date()] == 120
+    assert len(result) == 2, f"Expected 2 dates, got {result}"
+    assert result[date(2026, 7, 24)] == 120
+    assert result[date(2026, 7, 25)] == 120
 
 
 def test_split_crosses_midnight_with_timezone_offset():
     tz = "Asia/Shanghai"
     sh = pytz.timezone(tz)
-    start = datetime(2026, 7, 24, 23, 59, 0, tzinfo=sh)
-    end = datetime(2026, 7, 25, 0, 1, 0, tzinfo=sh)
+    start = sh.localize(datetime(2026, 7, 24, 23, 59, 0))
+    end = sh.localize(datetime(2026, 7, 25, 0, 1, 0))
     result = split_seconds_by_local_day(start, end, tz)
     assert sum(result.values()) == 120
     assert len(result) == 2
@@ -45,8 +46,8 @@ def test_split_exactly_at_midnight_boundary():
     end = datetime(2026, 7, 25, 0, 0, 1, tzinfo=timezone.utc)
     result = split_seconds_by_local_day(start, end, tz)
     assert len(result) == 2
-    assert result[datetime(2026, 7, 24).date()] == 1
-    assert result[datetime(2026, 7, 25).date()] == 1
+    assert result[date(2026, 7, 24)] == 1
+    assert result[date(2026, 7, 25)] == 1
 
 
 def test_split_spans_multiple_days():
@@ -55,9 +56,9 @@ def test_split_spans_multiple_days():
     end = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
     result = split_seconds_by_local_day(start, end, tz)
     assert len(result) == 3
-    assert result[datetime(2026, 7, 24).date()] == 12 * 3600
-    assert result[datetime(2026, 7, 25).date()] == 24 * 3600
-    assert result[datetime(2026, 7, 26).date()] == 12 * 3600
+    assert result[date(2026, 7, 24)] == 12 * 3600
+    assert result[date(2026, 7, 25)] == 24 * 3600
+    assert result[date(2026, 7, 26)] == 12 * 3600
 
 
 def test_split_utc_to_other_timezone():
@@ -85,4 +86,4 @@ def test_split_sub_minute_duration():
     end = start + timedelta(seconds=30)
     result = split_seconds_by_local_day(start, end, tz)
     assert len(result) == 1
-    assert result[datetime(2026, 7, 24).date()] == 30
+    assert result[date(2026, 7, 24)] == 30

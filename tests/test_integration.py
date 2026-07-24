@@ -261,7 +261,6 @@ async def test_policy_version_pinned_to_session(db_session):
 @requires_postgres
 async def test_cross_midnight_daily_usage_split(db_session):
     tz_name = "Asia/Shanghai"
-    sh = pytz.timezone(tz_name)
     clock = FixedClock(datetime(2026, 7, 24, 15, 55, 0, tzinfo=timezone.utc))
     id_gen = SequentialGenerator()
 
@@ -290,22 +289,30 @@ async def test_cross_midnight_daily_usage_split(db_session):
     assert rc == ReasonCode.OK
     await db_session.commit()
 
-    usage_24 = await session_svc.query_usage(TENANT, "user-midnight", tz_name)
-    assert usage_24["total_active_seconds"] == 600
-    await db_session.commit()
+    from sqlalchemy import text
+    r = await db_session.execute(
+        text("SELECT usage_date, total_seconds FROM daily_usage WHERE user_id='user-midnight' ORDER BY usage_date")
+    )
+    rows = r.fetchall()
+    date_seconds = {row[0]: row[1] for row in rows}
+    assert len(date_seconds) == 2, f"Expected 2 dates, got {len(date_seconds)}: {date_seconds}"
+    jul24 = datetime(2026, 7, 24).date()
+    jul25 = datetime(2026, 7, 25).date()
+    assert date_seconds[jul24] == 300, f"July 24 should have 300s, got {date_seconds[jul24]}"
+    assert date_seconds[jul25] == 300, f"July 25 should have 300s, got {date_seconds[jul25]}"
 
     clock.advance(minutes=10)
     result, rc, _ = await session_svc.heartbeat(TENANT, session_id, 2)
     assert rc == ReasonCode.OK
     await db_session.commit()
 
-    from sqlalchemy import text
-    r = await db_session.execute(
+    r2 = await db_session.execute(
         text("SELECT usage_date, total_seconds FROM daily_usage WHERE user_id='user-midnight' ORDER BY usage_date")
     )
-    rows = r.fetchall()
-    dates_with_usage = [(row[0], row[1]) for row in rows]
-    assert len(dates_with_usage) >= 1
+    rows2 = r2.fetchall()
+    date_seconds2 = {row[0]: row[1] for row in rows2}
+    assert date_seconds2[jul24] == 300
+    assert date_seconds2[jul25] == 900
 
 
 @requires_postgres
@@ -418,5 +425,114 @@ async def test_tenant_isolation(db_session):
     assert result_a["tenant_id"] == TENANT
     assert result_b["tenant_id"] == "tenant-b"
 
-    not_found, rc_nf, _ = await session_svc.get_session("tenant-b", result_a["id"])
+    not_found = await session_svc.get_session("tenant-b", result_a["id"])
     assert not_found is None
+
+    found = await session_svc.get_session(TENANT, result_a["id"])
+    assert found is not None
+    assert found["id"] == result_a["id"]
+
+
+@requires_postgres
+async def test_outbox_worker_processes_messages(db_session, session_factory):
+    from app.worker import process_batch, OutboxPublisher
+
+    clock = FixedClock(datetime(2026, 7, 24, 10, 0, 0, tzinfo=timezone.utc))
+    id_gen = SequentialGenerator()
+    policy_svc = PolicyService(db_session, clock=clock, id_generator=id_gen)
+    session_svc = SessionService(db_session, clock=clock, id_generator=id_gen)
+
+    await _publish_policy(db_session, policy_svc, _make_policy_simple())
+    await db_session.commit()
+
+    result, rc, _ = await session_svc.start_session(TENANT, "user-outbox2", user_age=20)
+    await db_session.commit()
+
+    from sqlalchemy import text
+    async with session_factory() as check_db:
+        r = await check_db.execute(
+            text("SELECT COUNT(*) FROM outbox_messages WHERE processed = false")
+        )
+        unprocessed_before = r.scalar()
+    assert unprocessed_before >= 1
+
+    publisher = OutboxPublisher()
+    processed = await process_batch(publisher, session_factory=session_factory)
+    assert processed >= 1
+
+    async with session_factory() as check_db:
+        r2 = await check_db.execute(
+            text("SELECT COUNT(*) FROM outbox_messages WHERE processed = false")
+        )
+        unprocessed_after = r2.scalar()
+    assert unprocessed_after == 0
+
+
+@requires_postgres
+async def test_restart_recovery_from_db(db_session):
+    clock = FixedClock(datetime(2026, 7, 24, 10, 0, 0, tzinfo=timezone.utc))
+    id_gen = SequentialGenerator()
+    policy_svc = PolicyService(db_session, clock=clock, id_generator=id_gen)
+    session_svc = SessionService(db_session, clock=clock, id_generator=id_gen)
+
+    await _publish_policy(db_session, policy_svc, _make_policy_simple())
+    await db_session.commit()
+
+    result, rc, _ = await session_svc.start_session(TENANT, "user-restart", user_age=20)
+    session_id = result["id"]
+    await db_session.commit()
+
+    clock.advance(seconds=120)
+    await session_svc.heartbeat(TENANT, session_id, 1)
+    await db_session.commit()
+
+    await session_svc.pause(TENANT, session_id)
+    await db_session.commit()
+
+    recovered = await session_svc.get_session(TENANT, session_id)
+    assert recovered is not None
+    assert recovered["status"] == "paused"
+    assert recovered["total_active_seconds"] == 120
+    assert recovered["id"] == session_id
+
+
+@requires_postgres
+async def test_multiple_sessions_accumulate_daily_usage(db_session):
+    tz_name = "UTC"
+    clock = FixedClock(datetime(2026, 7, 24, 10, 0, 0, tzinfo=timezone.utc))
+    id_gen = SequentialGenerator()
+    policy = PolicyAST(
+        version=1, name="daily-test",
+        rule=AndRule(rules=[
+            AgeGateRule(min_age=13),
+            DailyLimitRule(max_minutes_per_day=10, timezone=tz_name),
+        ]),
+    )
+    policy_svc = PolicyService(db_session, clock=clock, id_generator=id_gen)
+    session_svc = SessionService(db_session, clock=clock, id_generator=id_gen)
+
+    await _publish_policy(db_session, policy_svc, policy)
+    await db_session.commit()
+
+    r1, rc1, _ = await session_svc.start_session(TENANT, "user-multi", user_age=20, user_timezone=tz_name)
+    sid1 = r1["id"]
+    assert rc1 == ReasonCode.OK
+    await db_session.commit()
+
+    clock.advance(seconds=300)
+    await session_svc.heartbeat(TENANT, sid1, 1)
+    await session_svc.end_session(TENANT, sid1)
+    await db_session.commit()
+
+    clock.advance(seconds=60)
+    r2, rc2, _ = await session_svc.start_session(TENANT, "user-multi", user_age=20, user_timezone=tz_name)
+    sid2 = r2["id"]
+    assert rc2 == ReasonCode.OK
+    await db_session.commit()
+
+    clock.advance(seconds=300)
+    r3, rc3, _ = await session_svc.heartbeat(TENANT, sid2, 1)
+    await db_session.commit()
+
+    usage = await session_svc.query_usage(TENANT, "user-multi", tz_name)
+    assert usage["total_active_seconds"] == 600

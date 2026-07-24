@@ -64,7 +64,7 @@ class PolicyRepository:
             Policy.tenant_id == tenant_id
         )
         result = await self._db.execute(stmt)
-        return (result.scalar_one() or 0) + 1
+        return (result.scalar_one_or_none() or 0) + 1
 
     async def list_versions(self, tenant_id: str) -> list[Policy]:
         stmt = (

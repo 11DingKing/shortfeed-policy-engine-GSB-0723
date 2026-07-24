@@ -7,10 +7,11 @@ import signal
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
-from app.infrastructure.db.session import async_session_factory
+from app.infrastructure.db.session import async_session_factory as _default_factory
 from app.infrastructure.db.models.outbox import OutboxMessage
 
 logging.basicConfig(
@@ -33,8 +34,12 @@ class OutboxPublisher:
         )
 
 
-async def process_batch(publisher: OutboxPublisher) -> int:
-    async with async_session_factory() as db:
+async def process_batch(
+    publisher: OutboxPublisher,
+    session_factory: async_sessionmaker | None = None,
+) -> int:
+    factory = session_factory or _default_factory
+    async with factory() as db:
         try:
             stmt = (
                 select(OutboxMessage)
@@ -72,7 +77,7 @@ async def process_batch(publisher: OutboxPublisher) -> int:
             raise
 
 
-async def run_worker() -> None:
+async def run_worker(session_factory: async_sessionmaker | None = None) -> None:
     logger.info("Outbox worker starting (batch_size=%d, poll_interval=%.1fs)", BATCH_SIZE, POLL_INTERVAL_SECONDS)
     publisher = OutboxPublisher()
 
@@ -89,7 +94,7 @@ async def run_worker() -> None:
     total_processed = 0
     while not stop.is_set():
         try:
-            count = await process_batch(publisher)
+            count = await process_batch(publisher, session_factory)
             total_processed += count
             if count > 0:
                 logger.info("Batch processed: %d messages (total: %d)", count, total_processed)

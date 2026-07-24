@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, date, timedelta
 from typing import Any
 
@@ -14,10 +15,14 @@ from app.infrastructure.db.models.session_event import SessionEvent
 from app.infrastructure.db.models.daily_usage import DailyUsage
 
 
+def _local_midnight(target_date: date, tz: Any) -> datetime:
+    return tz.localize(datetime.combine(target_date, datetime.min.time()))
+
+
 def _day_bounds(target_date: date, user_timezone: str) -> tuple[datetime, datetime]:
     tz = pytz.timezone(user_timezone)
-    day_start = datetime.combine(target_date, datetime.min.time(), tzinfo=tz)
-    day_end = day_start + timedelta(days=1)
+    day_start = _local_midnight(target_date, tz)
+    day_end = _local_midnight(target_date + timedelta(days=1), tz)
     return day_start, day_end
 
 
@@ -33,7 +38,7 @@ def split_seconds_by_local_day(
     current = start_local
     while current < end_local:
         current_date = current.date()
-        day_end_local = datetime.combine(current_date + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+        day_end_local = _local_midnight(current_date + timedelta(days=1), tz)
         segment_end = min(end_local, day_end_local)
         seconds = int((segment_end - current).total_seconds())
         if seconds > 0:
@@ -114,6 +119,7 @@ class SessionRepository:
         stmt = (
             pg_insert(DailyUsage)
             .values(
+                id=str(uuid.uuid4()),
                 tenant_id=tenant_id,
                 user_id=user_id,
                 usage_date=target_date,
@@ -137,7 +143,7 @@ class SessionRepository:
             DailyUsage.user_timezone == user_timezone,
         )
         result = await self._db.execute(stmt)
-        return int(result.scalar_one() or 0)
+        return int(result.scalar_one_or_none() or 0)
 
     async def get_daily_usage_up_to(
         self, tenant_id: str, user_id: str, user_timezone: str, before_utc: datetime,
@@ -164,4 +170,4 @@ class SessionRepository:
             SessionDB.started_at < day_end,
         )
         result = await self._db.execute(stmt)
-        return int(result.scalar_one() or 0)
+        return int(result.scalar_one_or_none() or 0)

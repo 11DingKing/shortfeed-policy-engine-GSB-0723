@@ -61,16 +61,36 @@ make db-down        # 停止 PostgreSQL
 ## 测试
 
 ```bash
-# 单元测试（无需数据库，49 个测试）
+# 单元测试（无需数据库，49 个测试：策略引擎 + 会话聚合 + 跨午夜拆分）
 PYTHONPATH=. python -m pytest tests/test_policy_engine.py tests/test_session_aggregate.py tests/test_time_splitting.py -v
 
-# 集成测试（需要 PostgreSQL，12 个测试）
-TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/shortfeed_policy_test \
+# 集成测试（需要 PostgreSQL，15 个测试：完整生命周期、并发、跨午夜、outbox、重启恢复）
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/shortfeed_policy_test \
   PYTHONPATH=. python -m pytest tests/test_integration.py -v
 
-# 全部测试 (61 个)
-TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/shortfeed_policy_test \
+# 全部测试 (64 个)
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/shortfeed_policy_test \
   PYTHONPATH=. python -m pytest tests/ -v
+```
+
+> **注意**：Docker Compose 将 PostgreSQL 映射到主机端口 **5433**（避免与本地 5432 冲突）。
+
+### 运行全部测试（一键）
+
+```bash
+# 1. 启动 PostgreSQL
+docker compose up -d postgres
+
+# 2. 创建测试数据库
+docker exec shortfeed-policy-db psql -U postgres -c "CREATE DATABASE shortfeed_policy_test;"
+
+# 3. 运行全部测试
+source .venv/bin/activate
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/shortfeed_policy_test \
+  PYTHONPATH=. python -m pytest tests/ -v
+
+# 4. 启动完整服务（API + Worker + DB）
+docker compose up --build -d
 ```
 
 ---
@@ -292,5 +312,10 @@ tests/
 ├── test_policy_engine.py       # 策略引擎测试 (29)
 ├── test_session_aggregate.py   # 会话聚合测试 (12)
 ├── test_time_splitting.py      # 跨午夜拆分测试 (8)
-└── test_integration.py         # 端到端集成测试 (12)
+└── test_integration.py         # 端到端集成测试 (15)
+Dockerfile                      # API/Worker Docker 镜像
+docker-compose.yml              # PostgreSQL(5433) + API(8000) + Worker
+Makefile                        # 一键命令
+.env.example                    # 环境变量模板
+alembic.ini                     # Alembic 迁移配置
 ```

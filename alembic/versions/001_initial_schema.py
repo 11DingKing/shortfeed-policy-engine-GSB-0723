@@ -122,6 +122,19 @@ def upgrade() -> None:
     )
     op.create_index("ix_idempotency_keys_tenant_id", "idempotency_keys", ["tenant_id"])
 
+    op.create_table(
+        "daily_usage",
+        sa.Column("id", sa.String(64), primary_key=True),
+        sa.Column("tenant_id", sa.String(64), sa.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("user_id", sa.String(64), nullable=False),
+        sa.Column("usage_date", sa.Date(), nullable=False),
+        sa.Column("user_timezone", sa.String(64), nullable=False, server_default="UTC"),
+        sa.Column("total_seconds", sa.Integer(), nullable=False, server_default="0"),
+        sa.UniqueConstraint("tenant_id", "user_id", "usage_date", "user_timezone", name="uq_daily_usage_tenant_user_date_tz"),
+    )
+    op.create_index("ix_daily_usage_tenant_id", "daily_usage", ["tenant_id"])
+    op.create_index("ix_daily_usage_user_id", "daily_usage", ["user_id"])
+
     op.execute(
         "INSERT INTO tenants (id, name) VALUES ('default', 'Default Tenant') "
         "ON CONFLICT (id) DO NOTHING"
@@ -130,6 +143,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS ix_sessions_tenant_user_active")
+    op.drop_table("daily_usage")
     op.drop_table("idempotency_keys")
     op.drop_table("outbox_messages")
     op.drop_table("session_events")

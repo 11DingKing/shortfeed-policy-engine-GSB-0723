@@ -5,78 +5,72 @@
 ## 技术栈
 
 - **Python 3.12** + **FastAPI** + **Pydantic v2**
-- **SQLAlchemy 2** (async) + **asyncpg** + **PostgreSQL**
-- **Alembic** 数据库迁移
-- 分层架构：API → 领域 → 仓储 → Outbox
+- **SQLAlchemy 2** (async) + **asyncpg** + **PostgreSQL 16**
+- **Alembic** 数据库迁移（支持无停机部署）
+- **Outbox Pattern** 事务性事件发布 Worker
+- 分层架构：API → 服务 → 领域 → 仓储 → Outbox
 
 ---
 
-## 快速启动
-
-### 1. 环境准备
+## 一键启动（使用 Docker Compose）
 
 ```bash
-# 创建虚拟环境
+# 1. 启动 PostgreSQL
+docker compose up -d
+
+# 2. 设置环境
+cp .env.example .env
 python3.12 -m venv .venv
 source .venv/bin/activate
-
-# 安装依赖
-pip install fastapi "uvicorn[standard]" "pydantic&gt;=2.9.0" pydantic-settings \
-    "sqlalchemy&gt;=2.0.35" asyncpg alembic python-dateutil pytz greenlet \
+pip install fastapi "uvicorn[standard]" "pydantic>=2.9.0" pydantic-settings \
+    "sqlalchemy>=2.0.35" asyncpg alembic python-dateutil pytz greenlet \
     pytest pytest-asyncio httpx pytest-cov
 
-# 或使用 pyproject.toml
-pip install -e ".[dev]"
-```
-
-### 2. 配置数据库
-
-```bash
-# 设置环境变量（或创建 .env 文件）
-export DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/shortfeed_policy"
-```
-
-创建数据库：
-
-```bash
-createdb shortfeed_policy
-```
-
-### 3. 运行数据库迁移
-
-```bash
-# 执行迁移（初始化表结构）
+# 3. 创建数据库并迁移
+PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE DATABASE shortfeed_policy;"
 alembic upgrade head
-```
 
-### 4. 启动服务
-
-```bash
-# 开发模式
+# 4. 启动 API 服务
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
-# 生产模式
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+# 5. (另一个终端) 启动 Outbox Worker
+python -m app.worker
+```
+
+或使用 Makefile：
+
+```bash
+make setup          # 创建 venv 并安装依赖
+make db-up          # docker compose up -d
+make db-create      # 创建数据库
+make migrate        # alembic upgrade head
+make run            # 启动 API (开发模式)
+make worker         # 启动 Outbox Worker
+make test           # 运行单元测试 (无需数据库)
+make test-all       # 运行全部测试 (需要数据库)
+make db-down        # 停止 PostgreSQL
 ```
 
 服务启动后访问：
-- API 文档：http://localhost:8000/docs
+- API 文档（Swagger UI）：http://localhost:8000/docs
 - ReDoc：http://localhost:8000/redoc
 - 健康检查：http://localhost:8000/api/v1/health
 
 ---
 
-## 测试命令
+## 测试
 
 ```bash
-# 运行所有测试
-PYTHONPATH=. python -m pytest tests/ -v
+# 单元测试（无需数据库，49 个测试）
+PYTHONPATH=. python -m pytest tests/test_policy_engine.py tests/test_session_aggregate.py tests/test_time_splitting.py -v
 
-# 运行单元测试（不需要数据库）
-PYTHONPATH=. python -m pytest tests/test_policy_engine.py tests/test_session_aggregate.py -v
+# 集成测试（需要 PostgreSQL，12 个测试）
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/shortfeed_policy_test \
+  PYTHONPATH=. python -m pytest tests/test_integration.py -v
 
-# 运行测试并生成覆盖率报告
-PYTHONPATH=. python -m pytest tests/ --cov=app --cov-report=term-missing
+# 全部测试 (61 个)
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/shortfeed_policy_test \
+  PYTHONPATH=. python -m pytest tests/ -v
 ```
 
 ---
@@ -84,60 +78,36 @@ PYTHONPATH=. python -m pytest tests/ --cov=app --cov-report=term-missing
 ## 迁移命令
 
 ```bash
-# 升级到最新版本
-alembic upgrade head
-
-# 回滚一个版本
-alembic downgrade -1
-
-# 查看当前版本
-alembic current
-
-# 查看迁移历史
-alembic history
-
-# 创建新迁移（自动生成）
-alembic revision --autogenerate -m "description"
-
-# 创建空迁移
-alembic revision -m "description"
+alembic upgrade head       # 升级到最新版本
+alembic downgrade -1      # 回滚一个版本
+alembic current           # 查看当前版本
+alembic history           # 查看迁移历史
 ```
 
-### 无停机迁移
+### 无停机迁移策略
 
-初始迁移脚本采用以下无停机部署策略：
-
-1. **新列带 DEFAULT 值** — 已有行自动填充，不锁表
-2. **部分唯一索引** — 使用 PostgreSQL 部分索引 (`WHERE status IN ('active', 'paused')`) 防止双活动会话
-3. **外键使用 CASCADE** — 删除租户自动清理关联数据
-4. **JSONB 列** — PostgreSQL 原生 JSON 支持，可通过 GIN 索引查询
+- 新列带 `DEFAULT` 值，已有行自动填充，不锁表
+- 部分唯一索引 `(tenant_id, user_id) WHERE status IN ('active', 'paused')` 防止双活动会话
+- 外键使用 `ON DELETE CASCADE`
+- PostgreSQL `JSONB` + `ON CONFLICT DO UPDATE` (upsert) 用于每日用量原子累加
 
 ---
 
 ## 核心 API 端点
 
-所有端点需要 `X-Tenant-Id` 请求头标识租户。写操作支持 `Idempotency-Key` 请求头实现幂等。
-
-### 健康检查
+所有端点需要 `X-Tenant-Id` 请求头。写操作支持 `Idempotency-Key` 头实现幂等。
 
 | Method | Path | 说明 |
 |--------|------|------|
+| **健康检查** | | |
 | GET | `/api/v1/health` | 服务健康检查 |
-
-### 策略管理
-
-| Method | Path | 说明 |
-|--------|------|------|
+| **策略管理** | | |
 | POST | `/api/v1/policies` | 发布新版本策略 |
 | GET | `/api/v1/policies` | 列出所有策略版本 |
 | GET | `/api/v1/policies/{version}` | 获取指定版本策略 |
 | POST | `/api/v1/policies/preview` | 预览策略评估（无需数据库） |
 | POST | `/api/v1/policies/validate` | 静态校验策略 AST |
-
-### 会话管理
-
-| Method | Path | 说明 |
-|--------|------|------|
+| **会话管理** | | |
 | POST | `/api/v1/sessions` | 开始新会话 |
 | POST | `/api/v1/sessions/{id}/heartbeat` | 发送心跳 |
 | POST | `/api/v1/sessions/{id}/pause` | 暂停会话 |
@@ -147,74 +117,32 @@ alembic revision -m "description"
 | GET | `/api/v1/sessions/{id}/replay` | 历史重放（含评估轨迹） |
 | GET | `/api/v1/sessions/usage/{user_id}` | 查询用户用量 |
 
-### 请求示例
-
-#### 发布策略
+### cURL 示例
 
 ```bash
+# 发布策略
 curl -X POST http://localhost:8000/api/v1/policies \
-  -H "Content-Type: application/json" \
-  -H "X-Tenant-Id: default" \
-  -d '{
-    "name": "青少年保护策略",
-    "description": "适用于13-17岁用户的限时策略",
-    "ast": {
-      "version": 1,
-      "name": "青少年保护策略",
-      "rule": {
-        "type": "and",
-        "rules": [
-          {"type": "age_gate", "min_age": 13},
-          {"type": "daily_limit", "max_minutes_per_day": 120, "timezone": "Asia/Shanghai"},
-          {"type": "session_limit", "max_minutes_per_session": 30},
-          {
-            "type": "not",
-            "rule": {
-              "type": "bedtime_ban",
-              "start_time": "22:00",
-              "end_time": "06:00",
-              "timezone": "Asia/Shanghai"
-            }
-          }
-        ]
-      }
-    }
-  }'
-```
+  -H "Content-Type: application/json" -H "X-Tenant-Id: default" \
+  -d '{"name":"test","ast":{"version":1,"name":"test","rule":{"type":"and","rules":[{"type":"age_gate","min_age":13},{"type":"daily_limit","max_minutes_per_day":120,"timezone":"UTC"}]}}}'
 
-#### 开始会话
-
-```bash
+# 开始会话
 curl -X POST http://localhost:8000/api/v1/sessions \
-  -H "Content-Type: application/json" \
-  -H "X-Tenant-Id: default" \
-  -H "Idempotency-Key: start-user1-001" \
-  -d '{
-    "user_id": "user-001",
-    "user_age": 15,
-    "user_timezone": "Asia/Shanghai"
-  }'
-```
+  -H "Content-Type: application/json" -H "X-Tenant-Id: default" -H "Idempotency-Key: key-001" \
+  -d '{"user_id":"user-1","user_age":20}'
 
-#### 发送心跳
-
-```bash
+# 发送心跳
 curl -X POST http://localhost:8000/api/v1/sessions/{session_id}/heartbeat \
-  -H "Content-Type: application/json" \
-  -H "X-Tenant-Id: default" \
+  -H "Content-Type: application/json" -H "X-Tenant-Id: default" \
   -d '{"sequence": 1}'
-```
 
-#### 查询用量
-
-```bash
-curl "http://localhost:8000/api/v1/sessions/usage/user-001?timezone=Asia/Shanghai" \
+# 查询用量
+curl "http://localhost:8000/api/v1/sessions/usage/user-1?timezone=UTC" \
   -H "X-Tenant-Id: default"
 ```
 
 ---
 
-## 策略 AST 示例
+## 策略 AST
 
 ### 节点类型
 
@@ -223,14 +151,14 @@ curl "http://localhost:8000/api/v1/sessions/usage/user-001?timezone=Asia/Shangha
 | `age_gate` | 年龄门槛 | `min_age` |
 | `daily_limit` | 每日时长限额 | `max_minutes_per_day`, `timezone` |
 | `session_limit` | 单次会话限额 | `max_minutes_per_session` |
-| `bedtime_ban` | 睡前禁刷时段 | `start_time`, `end_time`, `timezone` |
+| `bedtime_ban` | 睡前禁刷 | `start_time`, `end_time`, `timezone` |
 | `time_window` | 允许使用时间窗 | `start_time`, `end_time`, `timezone`, `days_of_week` |
 | `exception` | 例外审批白名单 | `user_ids`, `reason`, `valid_until` |
 | `and` | 逻辑与 | `rules[]` |
 | `or` | 逻辑或 | `rules[]` |
 | `not` | 逻辑非 | `rule` |
 
-### 示例 1：基础青少年保护
+### 示例：青少年保护策略
 
 ```json
 {
@@ -246,8 +174,7 @@ curl "http://localhost:8000/api/v1/sessions/usage/user-001?timezone=Asia/Shangha
         "type": "not",
         "rule": {
           "type": "bedtime_ban",
-          "start_time": "22:00",
-          "end_time": "06:00",
+          "start_time": "22:00", "end_time": "06:00",
           "timezone": "Asia/Shanghai"
         }
       }
@@ -256,129 +183,46 @@ curl "http://localhost:8000/api/v1/sessions/usage/user-001?timezone=Asia/Shangha
 }
 ```
 
-### 示例 2：VIP 例外 + 时间窗
+---
 
-```json
-{
-  "version": 1,
-  "name": "VIP 策略",
-  "rule": {
-    "type": "and",
-    "rules": [
-      {"type": "age_gate", "min_age": 18},
-      {
-        "type": "or",
-        "rules": [
-          {"type": "exception", "user_ids": ["vip-001", "vip-002"], "reason": "付费会员"},
-          {
-            "type": "and",
-            "rules": [
-              {"type": "daily_limit", "max_minutes_per_day": 60, "timezone": "UTC"},
-              {
-                "type": "time_window",
-                "start_time": "08:00",
-                "end_time": "22:00",
-                "timezone": "UTC",
-                "days_of_week": [0, 1, 2, 3, 4]
-              }
-            ]
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+## 关键设计与一致性保障
 
-### 示例 3：仅周末放宽限制
+### 心跳正确性修复
+- **问题**：原实现在调用聚合根 `heartbeat()` 前预先更新 `last_heartbeat_seq`，导致合法心跳被误判为重复且不生成领域事件
+- **修复**：使用 `SELECT ... FOR UPDATE` 行锁读取会话 → 创建聚合根 → 聚合根校验并更新状态 → 回写 DB。聚合根是唯一的序号判断者
 
-```json
-{
-  "version": 1,
-  "name": "周末策略",
-  "rule": {
-    "type": "and",
-    "rules": [
-      {"type": "age_gate", "min_age": 13},
-      {
-        "type": "or",
-        "rules": [
-          {
-            "type": "and",
-            "rules": [
-              {"type": "daily_limit", "max_minutes_per_day": 60},
-              {
-                "type": "time_window",
-                "start_time": "08:00",
-                "end_time": "21:00",
-                "days_of_week": [0, 1, 2, 3, 4]
-              }
-            ]
-          },
-          {
-            "type": "and",
-            "rules": [
-              {"type": "daily_limit", "max_minutes_per_day": 180},
-              {
-                "type": "time_window",
-                "start_time": "09:00",
-                "end_time": "22:00",
-                "days_of_week": [5, 6]
-              }
-            ]
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+### 并发安全
+- **行级锁**：所有写操作（heartbeat/pause/resume/end）使用 `SELECT FOR UPDATE` 锁定会话行
+- **数据库约束**：PostgreSQL 部分唯一索引防止同一用户并发创建双活动会话
+- **原子 UPSERT**：每日用量使用 `INSERT ... ON CONFLICT DO UPDATE` 原子累加
+
+### 跨午夜时长拆分
+- 心跳/pause/end 时，计算从上一次心跳到当前时间的时长
+- 使用 `split_seconds_by_local_day()` 按用户本地时区将时长精确拆分到每个自然日
+- 拆分结果通过 `daily_usage` 表的 upsert 原子累加
+- 每日限额判断基于 `daily_usage` 表（累计同一用户本地日期内所有会话）
+
+### 历史重放
+- 重放时使用事件日志中的 delta_seconds 重建会话活跃时间
+- 按相同的跨午夜拆分逻辑计算当时的每日用量
+- `daily_used_minutes_at_time` 和 `session_active_seconds_at_time` 反映事件发生时的真实上下文
+
+### Outbox Worker
+- `python -m app.worker` 启动后台 Worker
+- 使用 `SELECT FOR UPDATE SKIP LOCKED` 批量获取未处理消息
+- 支持优雅关闭（SIGINT/SIGTERM）、重试计数和错误记录
+- 默认发布到日志（可扩展为消息队列）
+
+### 其他保障
+- **策略版本固定**：会话绑定策略 ID + version，新版本不影响历史结算
+- **租户隔离**：所有查询携带 `tenant_id`，`X-Tenant-Id` 头必填
+- **幂等键**：`Idempotency-Key` 头防止重复创建会话
+- **进程重启恢复**：所有状态持久化在 PostgreSQL
+- **可注入时钟/ID**：`FixedClock` + `SequentialGenerator` 支持确定性测试
 
 ---
 
-## 架构概览
-
-```
-┌─────────────────────────────────────────┐
-│              API Layer                   │
-│  FastAPI Routes + Pydantic Schemas       │
-│  (app/api/v1/)                           │
-├─────────────────────────────────────────┤
-│             Service Layer                │
-│  PolicyService / SessionService          │
-│  (app/services/)                         │
-├─────────────────────────────────────────┤
-│              Domain Layer                │
-│  Policy AST / Engine / Session Aggregate │
-│  Enums / Events / Checker                │
-│  (app/domain/)                           │
-├─────────────────────────────────────────┤
-│           Repository Layer               │
-│  PolicyRepo / SessionRepo / OutboxRepo   │
-│  (app/infrastructure/repositories/)      │
-├─────────────────────────────────────────┤
-│         Infrastructure Layer             │
-│  SQLAlchemy Models / DB Session          │
-│  Clock / IdGenerator (injectable)        │
-│  (app/infrastructure/)                   │
-└─────────────────────────────────────────┘
-```
-
-### 关键设计决策
-
-1. **策略版本固定**：每个会话启动时绑定当时的策略版本和策略 ID，新版本发布不影响已有会话的结算
-2. **数据库约束防并发**：PostgreSQL 部分唯一索引 `(tenant_id, user_id) WHERE status IN ('active', 'paused')` 确保同一用户不会同时有两个活动会话
-3. **心跳幂等**：通过 `last_heartbeat_seq` 追踪，重复或乱序心跳被安全拒绝
-4. **Outbox 模式**：领域事件通过事务性发件箱保证可靠投递
-5. **可注入时间/ID**：`Clock` 协议和 `IdGenerator` 协议支持测试时注入固定时钟和顺序 ID
-6. **时区感知**：每日限额和睡前禁刷均使用用户时区计算日界线
-7. **跨午夜处理**：按用户时区计算自然日，用量统计自动按日分界
-8. **进程重启恢复**：所有会话状态持久化在数据库，重启后从 DB 恢复
-9. **确定性重放**：基于不可变策略 AST + 事件日志，可完全重放任意历史会话的评估轨迹
-
----
-
-## 全部原因码含义
+## 全部原因码
 
 | Reason Code | 含义 |
 |-------------|------|
@@ -390,70 +234,63 @@ curl "http://localhost:8000/api/v1/sessions/usage/user-001?timezone=Asia/Shangha
 | `session_limit_exceeded` | 单次会话时长已达上限 |
 | `bedtime_ban_active` | 当前时间处于睡前禁刷时段 |
 | `not_in_time_window` | 当前时间不在允许使用的时间窗口内 |
-| `exception_approved` | 用户拥有经审批的例外权限，规则被覆盖 |
+| `exception_approved` | 用户拥有经审批的例外权限 |
 | `session_not_found` | 请求的会话不存在 |
 | `session_already_active` | 该用户已有一个活动会话 |
 | `session_not_active` | 会话当前不处于活动状态 |
-| `session_already_ended` | 会话已结束，无法执行操作 |
+| `session_already_ended` | 会话已结束 |
 | `session_already_paused` | 会话已处于暂停状态 |
-| `session_not_paused` | 会话未暂停，无法执行恢复 |
-| `duplicate_heartbeat` | 相同序号的心跳已处理过（幂等返回） |
-| `heartbeat_out_of_order` | 心跳序号小于最后处理的序号（乱序拒绝） |
-| `idempotency_conflict` | Idempotency-Key 与之前不同请求冲突 |
-| `tenant_mismatch` | 资源属于其他租户（租户隔离违规） |
-| `invalid_policy_ast` | 策略 AST 语法结构无效 |
-| `policy_version_pinned` | 会话绑定到特定策略版本，新版本不影响该会话 |
-| `concurrent_session_blocked` | 数据库约束阻止了并发活动会话的创建 |
-| `cross_midnight_reset` | 跨午夜时每日用量计数器已重置 |
-| `session_expired` | 会话因策略强制过期（如达到限额） |
+| `session_not_paused` | 会话未暂停，无法恢复 |
+| `duplicate_heartbeat` | 相同序号心跳已处理（幂等返回） |
+| `heartbeat_out_of_order` | 心跳序号小于已处理序号（乱序拒绝） |
+| `idempotency_conflict` | Idempotency-Key 与不同请求冲突 |
+| `tenant_mismatch` | 资源属于其他租户 |
+| `invalid_policy_ast` | 策略 AST 语法无效 |
+| `policy_version_pinned` | 会话绑定到特定策略版本 |
+| `concurrent_session_blocked` | 数据库约束阻止并发会话 |
+| `cross_midnight_reset` | 跨午夜时每日计数器已重置 |
+| `session_expired` | 会话因策略强制过期 |
 
 ---
 
 ## 项目结构
 
 ```
-shortfeed-policy-engine/
-├── app/
-│   ├── main.py                    # FastAPI 应用入口
-│   ├── config.py                  # 配置管理
-│   ├── api/
-│   │   ├── deps.py                # 依赖注入
-│   │   └── v1/
-│   │       ├── health.py          # 健康检查端点
-│   │       ├── policies.py        # 策略管理端点
-│   │       └── sessions.py        # 会话管理端点
-│   ├── domain/
-│   │   ├── enums.py               # 原因码、状态、动作枚举
-│   │   ├── policy/
-│   │   │   ├── ast.py             # 策略 AST Pydantic 模型
-│   │   │   ├── checker.py         # 策略静态校验器
-│   │   │   └── engine.py          # 策略评估引擎（含解释轨迹）
-│   │   └── session/
-│   │       ├── aggregate.py       # 会话聚合根
-│   │       └── events.py          # 领域事件
-│   ├── services/
-│   │   ├── policy_service.py      # 策略应用服务
-│   │   └── session_service.py     # 会话应用服务
-│   ├── schemas/
-│   │   ├── common.py              # 通用响应模型
-│   │   ├── policy.py              # 策略请求/响应模型
-│   │   └── session.py             # 会话请求/响应模型
-│   └── infrastructure/
-│       ├── clock.py               # 可注入时钟
-│       ├── id_generator.py        # 可注入 ID 生成器
-│       ├── db/
-│       │   ├── base.py            # SQLAlchemy 基类
-│       │   ├── session.py         # 异步数据库会话
-│       │   └── models/            # ORM 模型
-│       └── repositories/          # 数据仓储
-├── alembic/
-│   ├── env.py                     # Alembic 环境配置
-│   └── versions/
-│       └── 001_initial_schema.py  # 初始迁移脚本
-├── tests/
-│   ├── test_policy_engine.py      # 策略引擎单元测试（29个）
-│   └── test_session_aggregate.py  # 会话聚合单元测试（12个）
-├── pyproject.toml
-├── alembic.ini
-└── README.md
+app/
+├── main.py                     # FastAPI 入口
+├── config.py                   # 配置 (Pydantic Settings)
+├── worker.py                   # Outbox 发布 Worker
+├── api/
+│   ├── deps.py                 # 依赖注入
+│   └── v1/
+│       ├── health.py
+│       ├── policies.py
+│       └── sessions.py
+├── domain/
+│   ├── enums.py                # ReasonCode / SessionStatus / SessionAction
+│   ├── policy/
+│   │   ├── ast.py              # Pydantic AST 模型 (判别联合)
+│   │   ├── checker.py          # 静态校验
+│   │   └── engine.py           # 评估引擎 + TraceNode 解释轨迹
+│   └── session/
+│       ├── aggregate.py        # SessionAggregate 状态机
+│       └── events.py           # DomainEvent + EventRecorder
+├── services/
+│   ├── policy_service.py
+│   └── session_service.py      # 含跨午夜拆分、SELECT FOR UPDATE
+├── schemas/                    # Pydantic 请求/响应模型
+└── infrastructure/
+    ├── clock.py                # Clock Protocol (SystemClock/FixedClock)
+    ├── id_generator.py         # IdGenerator Protocol (Uuid4/Sequential)
+    ├── db/
+    │   ├── base.py
+    │   ├── session.py          # AsyncSession 工厂
+    │   └── models/             # SQLAlchemy 2 ORM 模型
+    └── repositories/           # 数据仓储 + Outbox
+tests/
+├── conftest.py                 # PostgreSQL 集成测试配置
+├── test_policy_engine.py       # 策略引擎测试 (29)
+├── test_session_aggregate.py   # 会话聚合测试 (12)
+├── test_time_splitting.py      # 跨午夜拆分测试 (8)
+└── test_integration.py         # 端到端集成测试 (12)
 ```

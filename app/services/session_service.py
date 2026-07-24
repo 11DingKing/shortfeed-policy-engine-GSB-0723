@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Any
 
 import pytz
@@ -18,7 +17,7 @@ from app.infrastructure.db.models.session import SessionDB
 from app.infrastructure.db.models.session_event import SessionEvent
 from app.infrastructure.id_generator import IdGenerator, Uuid4Generator
 from app.infrastructure.repositories.policy_repo import PolicyRepository
-from app.infrastructure.repositories.session_repo import SessionRepository
+from app.infrastructure.repositories.session_repo import SessionRepository, split_seconds_by_local_day
 from app.infrastructure.repositories.outbox_repo import OutboxRepository
 
 
@@ -68,12 +67,16 @@ class SessionService:
         now = self._now()
         ast = PolicyAST.model_validate(policy.ast_json)
 
+        daily_used_sec = await self._sessions.get_daily_used_seconds(
+            tenant_id, user_id, self._local_date(now, user_timezone), user_timezone,
+        )
+
         ctx = EvaluationContext(
             user_id=user_id,
             user_age=user_age,
             user_timezone=user_timezone,
             current_time=now,
-            daily_used_minutes=await self._calc_daily_used_minutes(tenant_id, user_id, user_timezone),
+            daily_used_minutes=daily_used_sec // 60,
             session_active_seconds=0,
         )
         result = evaluate_policy(ast, ctx)
@@ -138,41 +141,43 @@ class SessionService:
         session_id: str,
         sequence: int,
     ) -> tuple[dict[str, Any] | None, ReasonCode, str]:
-        db_session = await self._sessions.get_by_id(session_id, tenant_id)
+        db_session = await self._sessions.get_by_id_for_update(session_id, tenant_id)
         if db_session is None:
             return None, ReasonCode.SESSION_NOT_FOUND, REASON_CODE_MESSAGES[ReasonCode.SESSION_NOT_FOUND]
-
-        if db_session.tenant_id != tenant_id:
-            return None, ReasonCode.TENANT_MISMATCH, REASON_CODE_MESSAGES[ReasonCode.TENANT_MISMATCH]
 
         if db_session.status in (SessionStatus.ENDED.value, SessionStatus.EXPIRED.value):
             return self._session_to_response(db_session), ReasonCode.SESSION_ALREADY_ENDED, \
                 REASON_CODE_MESSAGES[ReasonCode.SESSION_ALREADY_ENDED]
-
-        if sequence < db_session.last_heartbeat_seq:
-            return self._session_to_response(db_session), ReasonCode.HEARTBEAT_OUT_OF_ORDER, \
-                REASON_CODE_MESSAGES[ReasonCode.HEARTBEAT_OUT_OF_ORDER]
-
-        if sequence == db_session.last_heartbeat_seq:
-            return self._session_to_response(db_session), ReasonCode.DUPLICATE_HEARTBEAT, \
-                REASON_CODE_MESSAGES[ReasonCode.DUPLICATE_HEARTBEAT]
 
         if db_session.status == SessionStatus.PAUSED.value:
             return self._session_to_response(db_session), ReasonCode.SESSION_NOT_ACTIVE, \
                 REASON_CODE_MESSAGES[ReasonCode.SESSION_NOT_ACTIVE]
 
         now = self._now()
-        prev_hb = db_session.last_heartbeat_at or db_session.started_at
-        delta = int((now - prev_hb).total_seconds())
-        if delta > 0:
-            db_session.total_active_seconds += delta
-        db_session.last_heartbeat_at = now
-        db_session.last_heartbeat_seq = sequence
-
-        await self._re_evaluate(db_session, now)
 
         aggregate = SessionAggregate.from_db_row(db_session)
         ok, reason = aggregate.heartbeat(sequence, now)
+
+        if not ok:
+            return self._session_to_response(db_session), reason, REASON_CODE_MESSAGES.get(reason, "")
+
+        day_splits = split_seconds_by_local_day(
+            db_session.last_heartbeat_at or db_session.started_at,
+            now,
+            db_session.user_timezone,
+        )
+        for d, secs in day_splits.items():
+            await self._sessions.add_daily_usage(tenant_id, db_session.user_id, d, db_session.user_timezone, secs)
+
+        self._apply_aggregate_to_db(aggregate, db_session)
+
+        daily_used_sec = await self._sessions.get_daily_used_seconds(
+            tenant_id, db_session.user_id,
+            self._local_date(now, db_session.user_timezone),
+            db_session.user_timezone,
+        )
+        await self._re_evaluate(db_session, now, daily_used_sec)
+
         await self._persist_events(db_session, aggregate)
         await self._sessions.update(db_session)
 
@@ -184,7 +189,7 @@ class SessionService:
     async def pause(
         self, tenant_id: str, session_id: str, reason: str | None = None
     ) -> tuple[dict[str, Any] | None, ReasonCode, str]:
-        db_session = await self._sessions.get_by_id(session_id, tenant_id)
+        db_session = await self._sessions.get_by_id_for_update(session_id, tenant_id)
         if db_session is None:
             return None, ReasonCode.SESSION_NOT_FOUND, REASON_CODE_MESSAGES[ReasonCode.SESSION_NOT_FOUND]
         now = self._now()
@@ -192,6 +197,11 @@ class SessionService:
         ok, rc = aggregate.pause(now)
         if not ok:
             return self._session_to_response(db_session), rc, REASON_CODE_MESSAGES[rc]
+        if db_session.status == SessionStatus.ACTIVE.value:
+            prev_hb = db_session.last_heartbeat_at or db_session.started_at
+            day_splits = split_seconds_by_local_day(prev_hb, now, db_session.user_timezone)
+            for d, secs in day_splits.items():
+                await self._sessions.add_daily_usage(tenant_id, db_session.user_id, d, db_session.user_timezone, secs)
         self._apply_aggregate_to_db(aggregate, db_session)
         await self._persist_events(db_session, aggregate)
         await self._sessions.update(db_session)
@@ -203,7 +213,7 @@ class SessionService:
     async def resume(
         self, tenant_id: str, session_id: str
     ) -> tuple[dict[str, Any] | None, ReasonCode, str]:
-        db_session = await self._sessions.get_by_id(session_id, tenant_id)
+        db_session = await self._sessions.get_by_id_for_update(session_id, tenant_id)
         if db_session is None:
             return None, ReasonCode.SESSION_NOT_FOUND, REASON_CODE_MESSAGES[ReasonCode.SESSION_NOT_FOUND]
         now = self._now()
@@ -212,7 +222,12 @@ class SessionService:
         if not ok:
             return self._session_to_response(db_session), rc, REASON_CODE_MESSAGES[rc]
         self._apply_aggregate_to_db(aggregate, db_session)
-        await self._re_evaluate(db_session, now)
+        daily_used_sec = await self._sessions.get_daily_used_seconds(
+            tenant_id, db_session.user_id,
+            self._local_date(now, db_session.user_timezone),
+            db_session.user_timezone,
+        )
+        await self._re_evaluate(db_session, now, daily_used_sec)
         await self._persist_events(db_session, aggregate)
         await self._sessions.update(db_session)
         resp = self._session_to_response(db_session)
@@ -223,7 +238,7 @@ class SessionService:
     async def end_session(
         self, tenant_id: str, session_id: str, reason: str | None = None
     ) -> tuple[dict[str, Any] | None, ReasonCode, str]:
-        db_session = await self._sessions.get_by_id(session_id, tenant_id)
+        db_session = await self._sessions.get_by_id_for_update(session_id, tenant_id)
         if db_session is None:
             return None, ReasonCode.SESSION_NOT_FOUND, REASON_CODE_MESSAGES[ReasonCode.SESSION_NOT_FOUND]
         now = self._now()
@@ -231,6 +246,11 @@ class SessionService:
         ok, rc = aggregate.end(now, reason)
         if not ok:
             return self._session_to_response(db_session), rc, REASON_CODE_MESSAGES[rc]
+        if db_session.status == SessionStatus.ACTIVE.value:
+            prev_hb = db_session.last_heartbeat_at or db_session.started_at
+            day_splits = split_seconds_by_local_day(prev_hb, now, db_session.user_timezone)
+            for d, secs in day_splits.items():
+                await self._sessions.add_daily_usage(tenant_id, db_session.user_id, d, db_session.user_timezone, secs)
         self._apply_aggregate_to_db(aggregate, db_session)
         await self._persist_events(db_session, aggregate)
         await self._write_outbox(session_id, tenant_id, "session.ended", {
@@ -254,22 +274,22 @@ class SessionService:
     ) -> dict[str, Any]:
         tz = pytz.timezone(user_timezone)
         if target_date is None:
-            target_date = self._clock.now().astimezone(tz).date()
+            target_date_local = self._clock.now().astimezone(tz).date()
         else:
-            target_date = target_date.astimezone(tz).date()
-        total_sec = await self._sessions.get_total_active_seconds_for_date(
-            tenant_id, user_id, target_date, user_timezone
+            target_date_local = target_date.astimezone(tz).date()
+        total_sec = await self._sessions.get_daily_used_seconds(
+            tenant_id, user_id, target_date_local, user_timezone,
         )
-        count = await self._sessions.count_sessions_for_date(tenant_id, user_id, target_date, user_timezone)
+        count = await self._sessions.count_sessions_for_date(tenant_id, user_id, target_date_local, user_timezone)
         active = await self._sessions.get_active_by_user(tenant_id, user_id)
-        daily_limit = await self._get_daily_limit(tenant_id, user_timezone)
+        daily_limit = await self._get_daily_limit(tenant_id)
         remaining = None
         if daily_limit is not None:
             remaining = max(0, daily_limit - (total_sec / 60.0))
         return {
             "tenant_id": tenant_id,
             "user_id": user_id,
-            "date": target_date.isoformat(),
+            "date": target_date_local.isoformat(),
             "total_sessions": count,
             "total_active_seconds": total_sec,
             "total_active_minutes": round(total_sec / 60.0, 2),
@@ -288,16 +308,38 @@ class SessionService:
         if policy is None:
             return None
         ast = PolicyAST.model_validate(policy.ast_json)
+        tz = pytz.timezone(db_session.user_timezone)
         replay: list[dict[str, Any]] = []
-        active_sec = 0
+        session_active_sec = 0
+        per_day_accum: dict[date, int] = {}
+
         for evt in events:
+            evt_local = evt.occurred_at.astimezone(tz)
+            evt_date = evt_local.date()
+
+            if evt.action == SessionAction.HEARTBEAT.value:
+                detail = evt.detail or {}
+                delta = detail.get("delta_seconds", 0)
+                splits = split_seconds_by_local_day(
+                    evt.occurred_at - timedelta(seconds=delta),
+                    evt.occurred_at,
+                    db_session.user_timezone,
+                )
+                for d, secs in splits.items():
+                    per_day_accum[d] = per_day_accum.get(d, 0) + secs
+                session_active_sec += delta
+            elif evt.action == SessionAction.START.value:
+                pass
+
+            daily_sec_for_day = per_day_accum.get(evt_date, 0)
+
             ctx = EvaluationContext(
                 user_id=db_session.user_id,
                 user_age=db_session.user_age,
                 user_timezone=db_session.user_timezone,
                 current_time=evt.occurred_at,
-                daily_used_minutes=0,
-                session_active_seconds=active_sec,
+                daily_used_minutes=daily_sec_for_day // 60,
+                session_active_seconds=session_active_sec,
             )
             result = evaluate_policy(ast, ctx)
             replay.append({
@@ -305,31 +347,26 @@ class SessionService:
                 "action": evt.action,
                 "occurred_at": evt.occurred_at.isoformat(),
                 "reason_code": evt.reason_code,
+                "daily_used_minutes_at_time": daily_sec_for_day // 60,
+                "session_active_seconds_at_time": session_active_sec,
                 "evaluation_allowed": result.allowed,
                 "evaluation_reason": result.reason_code.value,
                 "trace": result.trace.to_dict(),
             })
-            if evt.action == SessionAction.HEARTBEAT.value:
-                detail = evt.detail or {}
-                active_sec += detail.get("delta_seconds", 0)
         return replay
 
-    async def _calc_daily_used_minutes(self, tenant_id: str, user_id: str, user_timezone: str) -> int:
-        tz = pytz.timezone(user_timezone)
-        today = self._clock.now().astimezone(tz).date()
-        total_sec = await self._sessions.get_total_active_seconds_for_date(
-            tenant_id, user_id, today, user_timezone
-        )
-        return total_sec // 60
+    def _local_date(self, utc_dt: datetime, tz_name: str) -> date:
+        tz = pytz.timezone(tz_name)
+        return utc_dt.astimezone(tz).date()
 
-    async def _get_daily_limit(self, tenant_id: str, user_timezone: str) -> int | None:
+    async def _get_daily_limit(self, tenant_id: str) -> int | None:
         policy = await self._policies.get_latest(tenant_id)
         if policy is None:
             return None
         ast = PolicyAST.model_validate(policy.ast_json)
         return _extract_daily_limit(ast.rule)
 
-    async def _re_evaluate(self, db_session: SessionDB, now: datetime) -> None:
+    async def _re_evaluate(self, db_session: SessionDB, now: datetime, daily_used_sec: int) -> None:
         policy = await self._policies.get_by_id(db_session.policy_id)
         if policy is None:
             return
@@ -339,13 +376,19 @@ class SessionService:
             user_age=db_session.user_age,
             user_timezone=db_session.user_timezone,
             current_time=now,
-            daily_used_minutes=db_session.total_active_seconds // 60,
+            daily_used_minutes=daily_used_sec // 60,
             session_active_seconds=db_session.total_active_seconds,
         )
         result = evaluate_policy(ast, ctx)
         db_session.last_evaluation_reason = result.reason_code.value
         db_session.last_evaluation_detail = {"trace": result.trace.to_dict()}
         if not result.allowed:
+            prev_hb = db_session.last_heartbeat_at or db_session.started_at
+            day_splits = split_seconds_by_local_day(prev_hb, now, db_session.user_timezone)
+            for d, secs in day_splits.items():
+                await self._sessions.add_daily_usage(
+                    db_session.tenant_id, db_session.user_id, d, db_session.user_timezone, secs,
+                )
             aggregate = SessionAggregate.from_db_row(db_session)
             aggregate.apply_evaluation_result(False, result.reason_code, result.trace.to_dict(), now)
             self._apply_aggregate_to_db(aggregate, db_session)

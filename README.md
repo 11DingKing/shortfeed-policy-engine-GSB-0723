@@ -108,7 +108,12 @@ and every step is reversible:
   existing rows backfill without a rewrite; old code keeps working.
 - `0004_daily_usage_ledger` — creates the authoritative `daily_usage_ledger`,
   **folds** existing per-session daily usage into per-user totals (so consumed
-  quota is preserved across the cutover), then retires the old table.
+  quota is preserved across the cutover), then retires the old table. Its
+  **downgrade is data-preserving**: the ledger totals are written back into a
+  freshly recreated `session_daily_usage` (attributed to each user's most recent
+  session), so rolling `0004 → 0003` keeps consumed quota readable by old code,
+  and `0003 → 0004` re-derives the identical ledger — no loss, no double-count
+  across repeated cycles (covered by a real-Postgres round-trip test).
 
 ### Tests & lint
 

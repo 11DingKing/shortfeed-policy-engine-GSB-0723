@@ -1,21 +1,28 @@
 """Shared pytest fixtures.
 
-Every test runs against an isolated in-memory SQLite database with a deterministic
-:class:`FixedClock` and :class:`SequentialIdGenerator`, so outcomes (ids, traces,
-timestamps) are fully reproducible. The schema is created from the ORM metadata
-plus the partial unique index that guards the single-active-session invariant —
-mirroring what Alembic applies in production.
+Tests run against two backends:
+
+* **SQLite (in-memory / on-disk)** for fast, deterministic unit and API tests;
+* **real PostgreSQL** for the invariants the spec requires to be proven on the
+  production engine — version pinning, tenant isolation, cross-day settlement,
+  process restart, concurrency and Alembic migrations.
+
+All tests use a deterministic :class:`FixedClock` and
+:class:`SequentialIdGenerator`, so ids, traces and timestamps are reproducible.
+The Postgres fixtures are skipped automatically when no database is reachable.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from spe.app import create_app
 from spe.config import Settings
@@ -30,6 +37,27 @@ TENANT_B = "tenant-b"
 
 # A fixed reference instant: 2026-07-24 10:00 UTC.
 REFERENCE = datetime(2026, 7, 24, 10, 0, 0, tzinfo=UTC)
+
+# Real PostgreSQL used for the "must be proven on Postgres" invariants. Override
+# with SPE_TEST_DATABASE_URL; defaults to the local test container.
+PG_URL = os.environ.get(
+    "SPE_TEST_DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres@localhost:55439/spe_test",
+)
+
+_ALL_TABLES = (
+    "daily_usage_ledger",
+    "heartbeats",
+    "outbox",
+    "sessions",
+    "policies",
+)
+
+
+def birth_for_age(age: int, ref: datetime = REFERENCE) -> date:
+    """Return a birth date that makes the user exactly ``age`` at ``ref`` (UTC)."""
+    d = ref.date()
+    return date(d.year - age, d.month, d.day)
 
 
 @pytest.fixture
@@ -79,6 +107,70 @@ async def file_client(tmp_path, clock: FixedClock) -> AsyncIterator[AsyncClient]
     async with container.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(text(CREATE_ACTIVE_SESSION_INDEX))
+    app = create_app(container)
+    app.state.container = container
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    await container.dispose()
+
+
+async def _pg_reachable() -> bool:
+    """Return whether the target Postgres database is usable.
+
+    If the server is up but the target database does not yet exist, create it so
+    the suite is self-provisioning.
+    """
+    try:
+        engine = create_async_engine(PG_URL)
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        await engine.dispose()
+        return True
+    except Exception:
+        pass
+    # Try to create the database via the admin ('postgres') database.
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(PG_URL)
+        db_name = parts.path.lstrip("/")
+        admin = urlunsplit((parts.scheme, parts.netloc, "/postgres", "", ""))
+        engine = create_async_engine(admin, isolation_level="AUTOCOMMIT")
+        async with engine.connect() as conn:
+            await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+        await engine.dispose()
+        return True
+    except Exception:
+        return False
+
+
+@pytest_asyncio.fixture
+async def pg_schema() -> AsyncIterator[str]:
+    """Create the schema on the real Postgres once, truncating between tests."""
+    if not await _pg_reachable():
+        pytest.skip(f"PostgreSQL not reachable at {PG_URL}")
+    engine = create_async_engine(PG_URL)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text(CREATE_ACTIVE_SESSION_INDEX))
+        await conn.execute(
+            text("TRUNCATE " + ", ".join(_ALL_TABLES) + " RESTART IDENTITY CASCADE")
+        )
+    await engine.dispose()
+    yield PG_URL
+
+
+def make_pg_container(clock: FixedClock, ids_prefix: str = "id") -> Container:
+    """Build a container bound to the real Postgres (fresh engine = 'new process')."""
+    settings = Settings(database_url=PG_URL, heartbeat_max_gap_seconds=90)
+    return Container(settings=settings, clock=clock, ids=SequentialIdGenerator(ids_prefix))
+
+
+@pytest_asyncio.fixture
+async def pg_client(pg_schema: str, clock: FixedClock) -> AsyncIterator[AsyncClient]:
+    """An HTTP client backed by the real PostgreSQL database."""
+    container = make_pg_container(clock)
     app = create_app(container)
     app.state.container = container
     transport = ASGITransport(app=app)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import headers, sample_policy
+from tests.conftest import birth_for_age, headers, sample_policy
 
 pytestmark = pytest.mark.asyncio
 
@@ -45,7 +45,7 @@ async def test_preview_uses_active_policy(client) -> None:
     )
     resp = await client.post(
         "/v1/policies/preview",
-        json={"user_id": "u1", "user_age": 15},
+        json={"user_id": "u1", "birth_date": birth_for_age(15).isoformat()},
         headers=headers(),
     )
     assert resp.status_code == 200
@@ -58,7 +58,7 @@ async def test_preview_uses_active_policy(client) -> None:
 async def test_preview_without_policy_404(client) -> None:
     resp = await client.post(
         "/v1/policies/preview",
-        json={"user_id": "u1", "user_age": 15},
+        json={"user_id": "u1", "birth_date": birth_for_age(15).isoformat()},
         headers=headers(),
     )
     assert resp.status_code == 404

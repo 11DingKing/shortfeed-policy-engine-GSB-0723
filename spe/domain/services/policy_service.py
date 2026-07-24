@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
+
 from spe.domain.clock import Clock
 from spe.domain.events import DomainEvent
 from spe.domain.ids import IdGenerator
@@ -10,6 +12,7 @@ from spe.domain.policy_interpreter import EvalContext, evaluate
 from spe.domain.policy_validator import ValidationResult, validate_policy
 from spe.domain.repositories import OutboxRepository, PolicyRepository
 from spe.domain.services.responses import PolicyPublished, PreviewResult
+from spe.domain.timeutil import age_at
 
 
 class PolicyValidationError(Exception):
@@ -69,12 +72,19 @@ class PolicyService:
     async def preview(
         self,
         tenant_id: str,
-        ctx: EvalContext,
+        *,
+        user_id: str,
+        birth_date: date,
+        now: datetime,
+        daily_usage_seconds: int = 0,
+        session_elapsed_seconds: int = 0,
         version: int | None = None,
     ) -> PreviewResult | None:
         """Evaluate the active (or a specific) policy against a hypothetical context.
 
-        Returns ``None`` if no matching policy exists.
+        The user's age is derived from ``birth_date`` and ``now`` in the policy's
+        own timezone, so previews match live evaluation exactly. Returns ``None``
+        if no matching policy exists.
         """
         record = (
             await self._policies.get_version(tenant_id, version)
@@ -83,6 +93,14 @@ class PolicyService:
         )
         if record is None:
             return None
+        tz = record.document.rules.timezone
+        ctx = EvalContext(
+            now=now,
+            user_id=user_id,
+            user_age=age_at(birth_date, now, tz),
+            daily_usage_seconds=daily_usage_seconds,
+            session_elapsed_seconds=session_elapsed_seconds,
+        )
         decision = evaluate(record.document, ctx)
         return PreviewResult(
             allowed=decision.allowed,

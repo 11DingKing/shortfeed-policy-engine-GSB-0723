@@ -13,7 +13,6 @@ from spe.api.schemas.http import (
     PublishPolicyResponse,
     ValidationIssueOut,
 )
-from spe.domain.policy_interpreter import EvalContext
 from spe.domain.reason_codes import ReasonCode
 from spe.domain.services.policy_service import PolicyValidationError
 
@@ -61,14 +60,15 @@ async def preview_policy(
 ) -> PreviewResponse:
     """Dry-run the active (or a specific) policy against a hypothetical context."""
     now = body.at or svc.clock.now()
-    ctx = EvalContext(
-        now=now,
+    result = await svc.policy_service.preview(
+        tenant_id,
         user_id=body.user_id,
-        user_age=body.user_age,
+        birth_date=body.birth_date,
+        now=now,
         daily_usage_seconds=body.daily_usage_seconds,
         session_elapsed_seconds=body.session_elapsed_seconds,
+        version=body.version,
     )
-    result = await svc.policy_service.preview(tenant_id, ctx, version=body.version)
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

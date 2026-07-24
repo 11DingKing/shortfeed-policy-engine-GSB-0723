@@ -8,7 +8,7 @@ HTTP responses. Genuine programming errors still raise.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from spe.domain.policy_interpreter import DecisionTrace
@@ -45,11 +45,11 @@ class SessionView:
     policy_id: str
     policy_version: int
     status: SessionStatus
+    birth_date: date
     started_at: datetime
     updated_at: datetime
     ended_at: datetime | None
     total_watched_seconds: int
-    daily: dict[str, int]
 
     @classmethod
     def of(cls, s: Session) -> SessionView:
@@ -60,11 +60,11 @@ class SessionView:
             policy_id=s.policy_id,
             policy_version=s.policy_version,
             status=s.status,
+            birth_date=s.birth_date,
             started_at=s.started_at,
             updated_at=s.updated_at,
             ended_at=s.ended_at,
             total_watched_seconds=s.total_watched_seconds,
-            daily={k: v.seconds for k, v in sorted(s.daily.items())},
         )
 
 

@@ -52,7 +52,7 @@ async def start_session(
     result = await svc.session_service.start(
         tenant_id=tenant_id,
         user_id=body.user_id,
-        user_age=body.user_age,
+        birth_date=body.birth_date,
         idempotency_key=body.idempotency_key,
     )
     _raise_if_http_error(result)

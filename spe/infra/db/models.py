@@ -8,9 +8,11 @@ Schema highlights that enforce the engine's invariants at the database level:
   to non-ended statuses, so a user can never have two concurrently active/paused
   sessions — concurrent starts collide at the DB, not just in application code.
 * ``sessions`` also has a unique ``(tenant_id, idempotency_key)`` so a repeated
-  start request maps back to the same row.
-* ``session_daily_usage`` buckets watch-time by local day for cross-midnight
-  settlement, unique on ``(session_id, local_day)``.
+  start request maps back to the same row. It stores the user's ``birth_date``;
+  age is derived dynamically at evaluation time.
+* ``daily_usage_ledger`` is the authoritative per-(tenant, user, local_day) watch
+  budget, unique on ``(tenant_id, user_id, local_day)``. It is independent of any
+  session, so restarting a session never resets a user's daily quota.
 * ``heartbeats`` records each accepted beat, unique on ``(session_id, seq)``, for
   historical replay.
 * ``outbox`` stores domain events in the same transaction as state changes.
@@ -20,12 +22,13 @@ All tables are tenant-scoped; every query filters by ``tenant_id``.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -33,7 +36,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from spe.infra.db.base import Base
 
@@ -82,6 +85,7 @@ class SessionModel(Base):
     policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    birth_date: Mapped[date] = mapped_column(Date, nullable=False)
 
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -91,28 +95,22 @@ class SessionModel(Base):
     watched_seconds_marker: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_watched_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    daily_usage: Mapped[list[DailyUsageModel]] = relationship(
-        back_populates="session", cascade="all, delete-orphan", lazy="selectin"
-    )
 
+class DailyUsageLedgerModel(Base):
+    """Authoritative per-(tenant, user, local-day) watch-time ledger."""
 
-class DailyUsageModel(Base):
-    """Per-local-day watch-time bucket for a session."""
-
-    __tablename__ = "session_daily_usage"
+    __tablename__ = "daily_usage_ledger"
     __table_args__ = (
-        UniqueConstraint("session_id", "local_day", name="uq_daily_session_day"),
+        UniqueConstraint(
+            "tenant_id", "user_id", "local_day", name="uq_ledger_tenant_user_day"
+        ),
     )
 
     id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
-    session_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
-    )
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
     local_day: Mapped[str] = mapped_column(String(10), nullable=False)
     seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-
-    session: Mapped[SessionModel] = relationship(back_populates="daily_usage")
 
 
 class HeartbeatModel(Base):

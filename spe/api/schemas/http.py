@@ -7,7 +7,7 @@ Every field is explicitly typed; reason codes are surfaced as the
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
@@ -42,10 +42,14 @@ class CheckPolicyResponse(BaseModel):
 
 
 class PreviewRequest(BaseModel):
-    """A hypothetical evaluation context for a dry-run preview."""
+    """A hypothetical evaluation context for a dry-run preview.
+
+    The user's age is derived from ``birth_date`` and the evaluation instant in
+    the policy timezone, matching how live sessions compute age.
+    """
 
     user_id: str
-    user_age: int = Field(ge=0, le=130)
+    birth_date: date
     daily_usage_seconds: int = Field(default=0, ge=0)
     session_elapsed_seconds: int = Field(default=0, ge=0)
     at: datetime | None = None
@@ -70,7 +74,7 @@ class PreviewResponse(BaseModel):
 
 class StartSessionRequest(BaseModel):
     user_id: str
-    user_age: int = Field(ge=0, le=130)
+    birth_date: date
     idempotency_key: str | None = None
 
 
@@ -86,11 +90,11 @@ class SessionOut(BaseModel):
     policy_id: str
     policy_version: int
     status: SessionStatus
+    birth_date: date
     started_at: datetime
     updated_at: datetime
     ended_at: datetime | None
     total_watched_seconds: int
-    daily: dict[str, int]
 
 
 class ActionResponse(BaseModel):
@@ -109,9 +113,9 @@ class ActionResponse(BaseModel):
 class ReplayStepOut(BaseModel):
     seq: int
     credited_seconds: int
-    local_day: str
-    daily_usage_seconds: int
+    per_day: dict[str, int]
     total_watched_seconds: int
+    age: int
     allowed: bool
     reason: str
     trace: list[TraceStepOut]

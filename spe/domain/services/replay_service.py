@@ -1,27 +1,35 @@
 """Historical replay service.
 
-Given a finished (or in-flight) session, re-derive its decision trace by
-replaying its recorded heartbeats against the *pinned* policy version. Because
-both the policy document and the accounting rules are deterministic, the replay
-reproduces the original settlement exactly — the tool used to audit disputes and
-to prove that publishing new versions never rewrote history.
+Given a finished (or in-flight) session, re-derive its settlement by replaying
+its recorded heartbeats against the *pinned* policy version. Because both the
+policy document and the accounting rules are deterministic, the replay reproduces
+the original per-day settlement exactly — the tool used to audit disputes and to
+prove that publishing new versions never rewrote history.
+
+The replay mirrors :meth:`SessionService.heartbeat`: age is derived dynamically
+from the session's birth date at each heartbeat instant (no hard-coded age),
+proposed deltas are split across local midnight and truncated to the remaining
+session and daily budgets. An optional ``daily_baseline`` supplies watch-time
+other sessions had already booked against a given local day, so a session that
+shared a day with siblings can still be reproduced faithfully.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from spe.domain.policy_ast import PolicyDocument
 from spe.domain.policy_interpreter import EvalContext, evaluate
 from spe.domain.session import Session
-from spe.domain.timeutil import local_day_key
+from spe.domain.timeutil import age_at, split_watch_window
 
 
 @dataclass
 class HeartbeatRecord:
     """A recorded heartbeat used as replay input."""
 
-    occurred_at: object  # datetime; kept loose to avoid import churn
+    occurred_at: datetime
     seq: int
     watched_seconds_total: int
 
@@ -32,9 +40,9 @@ class ReplayStep:
 
     seq: int
     credited_seconds: int
-    local_day: str
-    daily_usage_seconds: int
+    per_day: dict[str, int]
     total_watched_seconds: int
+    age: int
     allowed: bool
     reason: str
     trace: list[dict[str, str | None]]
@@ -45,50 +53,78 @@ def replay_session(
     document: PolicyDocument,
     heartbeats: list[HeartbeatRecord],
     max_gap_seconds: int = 90,
+    daily_baseline: dict[str, int] | None = None,
 ) -> list[ReplayStep]:
-    """Deterministically replay ``heartbeats`` for ``session`` against ``document``.
+    """Deterministically replay ``heartbeats`` for ``session`` against ``document``."""
+    tz = document.rules.timezone
+    session_cap = (
+        document.rules.session_limit.max_seconds if document.rules.session_limit else None
+    )
+    daily_cap = document.rules.daily_limit.max_seconds if document.rules.daily_limit else None
 
-    The function mirrors :meth:`SessionService.heartbeat`'s accounting so a replay
-    yields identical per-day settlement and decisions.
-    """
     steps: list[ReplayStep] = []
     last_seq = 0
     marker = 0
     total = 0
-    daily: dict[str, int] = {}
+    daily: dict[str, int] = dict(daily_baseline or {})
 
     for hb in sorted(heartbeats, key=lambda h: h.seq):
         if hb.seq <= last_seq:
             continue  # stale / duplicate / out-of-order
-        raw_delta = hb.watched_seconds_total - marker
-        delta = max(0, min(raw_delta, max_gap_seconds))
-        local_day = local_day_key(hb.occurred_at, document.rules.timezone)  # type: ignore[arg-type]
-        daily[local_day] = daily.get(local_day, 0) + delta
-        total += delta
+        proposed = max(0, min(hb.watched_seconds_total - marker, max_gap_seconds))
         marker = max(marker, hb.watched_seconds_total)
         last_seq = hb.seq
 
+        credited = 0
+        per_day: dict[str, int] = {}
+        hit_limit = False
+        reason = "ALLOWED"
+        for day, segment in split_watch_window(hb.occurred_at, proposed, tz):
+            allow = segment
+            if session_cap is not None:
+                remaining = session_cap - total
+                if allow >= remaining:
+                    allow = max(0, remaining)
+                    hit_limit = True
+                    reason = "DENIED_SESSION_LIMIT_REACHED"
+            if daily_cap is not None:
+                remaining = daily_cap - daily.get(day, 0)
+                if allow >= remaining:
+                    allow = max(0, remaining)
+                    hit_limit = True
+                    reason = "DENIED_DAILY_LIMIT_REACHED"
+            if allow > 0:
+                daily[day] = daily.get(day, 0) + allow
+                total += allow
+                credited += allow
+                per_day[day] = per_day.get(day, 0) + allow
+            if hit_limit:
+                break
+
+        age = age_at(session.birth_date, hb.occurred_at, tz)
+        # Produce a representative decision trace for this heartbeat instant.
+        primary_day = next(iter(per_day), split_watch_window(hb.occurred_at, 1, tz)[0][0])
         ctx = EvalContext(
-            now=hb.occurred_at,  # type: ignore[arg-type]
+            now=hb.occurred_at,
             user_id=session.user_id,
-            user_age=130,
-            daily_usage_seconds=daily[local_day],
+            user_age=age,
+            daily_usage_seconds=daily.get(primary_day, 0),
             session_elapsed_seconds=total,
         )
         decision = evaluate(document, ctx)
         steps.append(
             ReplayStep(
                 seq=hb.seq,
-                credited_seconds=delta,
-                local_day=local_day,
-                daily_usage_seconds=daily[local_day],
+                credited_seconds=credited,
+                per_day=per_day,
                 total_watched_seconds=total,
-                allowed=decision.allowed,
-                reason=decision.reason.value,
+                age=age,
+                allowed=not hit_limit and decision.allowed,
+                reason=reason if hit_limit else decision.reason.value,
                 trace=decision.trace.as_list(),
             )
         )
-        if not decision.allowed:
-            break  # session would have ended here
+        if hit_limit:
+            break
 
     return steps

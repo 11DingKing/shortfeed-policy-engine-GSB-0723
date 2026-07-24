@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +21,7 @@ from spe.domain.repositories import PolicyRecord
 from spe.domain.services.session_service import ActiveSessionExists
 from spe.domain.session import Session
 from spe.infra.db.models import (
+    DailyUsageLedgerModel,
     HeartbeatModel,
     OutboxModel,
     PolicyModel,
@@ -105,7 +108,7 @@ class SqlSessionRepository:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
-    async def add(self, session: Session) -> None:
+    async def add(self, session: Session, idempotency_key: str | None = None) -> None:
         model = SessionModel(
             id=session.id,
             tenant_id=session.tenant_id,
@@ -113,7 +116,8 @@ class SqlSessionRepository:
             policy_id=session.policy_id,
             policy_version=session.policy_version,
             status=session.status.value,
-            idempotency_key=None,
+            idempotency_key=idempotency_key,
+            birth_date=session.birth_date,
             started_at=session.started_at,
             updated_at=session.updated_at,
             ended_at=session.ended_at,
@@ -124,7 +128,7 @@ class SqlSessionRepository:
         self._db.add(model)
         try:
             await self._db.flush()
-        except IntegrityError as exc:  # single-active-session guard tripped
+        except IntegrityError as exc:  # single-active-session / idempotency guard tripped
             await self._db.rollback()
             raise ActiveSessionExists(str(exc)) from exc
 
@@ -132,6 +136,18 @@ class SqlSessionRepository:
         stmt = select(SessionModel).where(
             SessionModel.tenant_id == tenant_id, SessionModel.id == session_id
         )
+        model = (await self._db.execute(stmt)).scalar_one_or_none()
+        return session_to_domain(model) if model else None
+
+    async def get_for_update(self, tenant_id: str, session_id: str) -> Session | None:
+        stmt = select(SessionModel).where(
+            SessionModel.tenant_id == tenant_id, SessionModel.id == session_id
+        )
+        # Row-level lock so concurrent heartbeats for one session serialise.
+        # SQLite has no row locks (single writer already serialises), so only
+        # apply the FOR UPDATE clause on backends that support it.
+        if self._db.bind is not None and self._db.bind.dialect.name != "sqlite":
+            stmt = stmt.with_for_update()
         model = (await self._db.execute(stmt)).scalar_one_or_none()
         return session_to_domain(model) if model else None
 
@@ -163,6 +179,49 @@ class SqlSessionRepository:
         if idempotency_key is not None:
             model.idempotency_key = idempotency_key
         await self._db.flush()
+
+
+class SqlDailyUsageLedger:
+    """Authoritative daily usage ledger backed by ``daily_usage_ledger``.
+
+    Increments use a dialect-native atomic upsert (``INSERT ... ON CONFLICT DO
+    UPDATE``) so concurrent writers accumulate correctly without a lost update,
+    and the running total is returned in the same round trip.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self._db = db
+
+    async def get_seconds(self, tenant_id: str, user_id: str, local_day: str) -> int:
+        stmt = select(DailyUsageLedgerModel.seconds).where(
+            DailyUsageLedgerModel.tenant_id == tenant_id,
+            DailyUsageLedgerModel.user_id == user_id,
+            DailyUsageLedgerModel.local_day == local_day,
+        )
+        return (await self._db.execute(stmt)).scalar() or 0
+
+    async def add_seconds(
+        self, tenant_id: str, user_id: str, local_day: str, seconds: int
+    ) -> int:
+        if seconds <= 0:
+            return await self.get_seconds(tenant_id, user_id, local_day)
+
+        values = {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "local_day": local_day,
+            "seconds": seconds,
+        }
+        dialect = self._db.bind.dialect.name if self._db.bind is not None else "sqlite"
+        insert = pg_insert if dialect == "postgresql" else sqlite_insert
+        stmt = insert(DailyUsageLedgerModel).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["tenant_id", "user_id", "local_day"],
+            set_={"seconds": DailyUsageLedgerModel.seconds + seconds},
+        )
+        await self._db.execute(stmt)
+        await self._db.flush()
+        return await self.get_seconds(tenant_id, user_id, local_day)
 
 
 class SqlOutboxRepository:

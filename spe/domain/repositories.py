@@ -59,6 +59,17 @@ class SessionRepository(Protocol):
 
     async def get(self, tenant_id: str, session_id: str) -> Session | None: ...
 
+    async def get_for_update(
+        self, tenant_id: str, session_id: str
+    ) -> Session | None:
+        """Read a session, taking a row lock so a heartbeat serialises writers.
+
+        Concurrent heartbeats for the same session block here until the holder
+        commits, which guarantees the sequence/marker/usage updates are applied
+        exactly once and in order even under contention.
+        """
+        ...
+
     async def get_active_for_user(self, tenant_id: str, user_id: str) -> Session | None: ...
 
     async def get_by_idempotency_key(
@@ -66,6 +77,26 @@ class SessionRepository(Protocol):
     ) -> Session | None: ...
 
     async def save(self, session: Session, idempotency_key: str | None = None) -> None: ...
+
+
+class DailyUsageLedger(Protocol):
+    """Authoritative daily watch-time ledger, keyed by (tenant, user, local-day).
+
+    This ledger is the source of truth for the daily limit. It is deliberately
+    independent of any single session so that ending one session and starting
+    another on the same local day continues to accumulate against the same
+    quota — a user cannot reset their daily allowance by restarting.
+    """
+
+    async def get_seconds(self, tenant_id: str, user_id: str, local_day: str) -> int:
+        """Return seconds already consumed by the user on ``local_day``."""
+        ...
+
+    async def add_seconds(
+        self, tenant_id: str, user_id: str, local_day: str, seconds: int
+    ) -> int:
+        """Atomically add ``seconds`` to the day's total and return the new total."""
+        ...
 
 
 class OutboxRepository(Protocol):

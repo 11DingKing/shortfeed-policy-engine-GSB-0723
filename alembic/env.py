@@ -1,16 +1,17 @@
 """Alembic environment.
 
-Runs migrations synchronously. The async production DSN (``postgresql+asyncpg``)
-is normalised to its sync driver (``postgresql+psycopg`` or ``psycopg2`` when
-available; falls back to the default) purely for the migration connection, so the
-same ``SPE_DATABASE_URL`` used by the app also drives Alembic.
+Runs migrations over an **async** engine because only async drivers
+(``asyncpg`` / ``aiosqlite``) are installed. The same ``SPE_DATABASE_URL`` used
+by the application drives Alembic, so migrations exercise the identical driver
+stack in tests (PostgreSQL via asyncpg) and production.
 """
 
 from __future__ import annotations
 
+import asyncio
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from spe.config import get_settings
@@ -24,18 +25,13 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
-def _sync_url() -> str:
-    url = get_settings().database_url
-    # Alembic uses a synchronous engine; strip async drivers.
-    return (
-        url.replace("+asyncpg", "+psycopg")
-        .replace("+aiosqlite", "")
-    )
+def _url() -> str:
+    return get_settings().database_url
 
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=_sync_url(),
+        url=_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -44,23 +40,26 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    section = config.get_section(config.config_ini_section, {})
-    section["sqlalchemy.url"] = _sync_url()
-    connectable = engine_from_config(
-        section, prefix="sqlalchemy.", poolclass=pool.NullPool
+def _do_run_migrations(connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_as_batch=connection.dialect.name == "sqlite",
     )
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            render_as_batch=connection.dialect.name == "sqlite",
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_migrations_online() -> None:
+    section = config.get_section(config.config_ini_section, {})
+    section["sqlalchemy.url"] = _url()
+    connectable = async_engine_from_config(section, prefix="sqlalchemy.")
+    async with connectable.connect() as connection:
+        await connection.run_sync(_do_run_migrations)
+    await connectable.dispose()
 
 
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    run_migrations_online()
+    asyncio.run(run_migrations_online())

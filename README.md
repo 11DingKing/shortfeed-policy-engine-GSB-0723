@@ -15,11 +15,27 @@ guarantees.
 - **Single active session** — enforced by a partial unique DB index, not just
   application code; concurrent starts collide at the database.
 - **Ordered, idempotent heartbeats** — duplicate / out-of-order beats are ignored;
-  only the new positive watch-time delta is credited (clamped per interval).
-- **Cross-midnight settlement** — watch-time is bucketed by *local* day in the
-  policy timezone, so usage rolls over exactly at local midnight.
+  only the new positive watch-time delta is credited (clamped per interval) and
+  serialised via a `SELECT ... FOR UPDATE` row lock so concurrent beats can't
+  double-count.
+- **Budget-truncated crediting** — a heartbeat delta is truncated to what remains
+  of *both* the session limit and the daily limit *before* it is written, so usage
+  is never over-recorded and then rolled back. Hitting a hard limit ends the
+  session with exactly the creditable amount booked.
+- **Authoritative daily ledger** — daily usage lives in a per-`(tenant, user,
+  local-day)` ledger, independent of any session. Ending a session and starting a
+  new one on the same local day continues against the same quota — a user cannot
+  reset their daily allowance by restarting.
+- **Dynamic age** — sessions store a **birth date**; age is derived from the birth
+  date and the current local date at every evaluation (start, heartbeat, replay).
+  Nothing is hard-coded.
+- **Precise cross-midnight split** — a heartbeat interval that straddles local
+  midnight is divided to the second between the two local days.
+- **Single-transaction consistency** — within one request the session mutation,
+  ledger increment, heartbeat record, idempotency key and outbox event all commit
+  in the *same* database transaction (transactional outbox).
 - **Deterministic interpretation & replay** — evaluation is a pure function that
-  emits a stable decision trace; a finished session can be replayed byte-for-byte.
+  emits a stable decision trace; a finished session can be replayed exactly.
 - **Tenant isolation** — every query is scoped by `X-Tenant-ID`.
 - **Process-restart safe** — all state lives in PostgreSQL; ids and time are
   injected, so restarts and tests are deterministic.
@@ -31,11 +47,12 @@ spe/
   api/           FastAPI transport: routes + wire schemas (no business logic)
   domain/        Pure business core: policy AST, validator, interpreter,
                  session aggregate, services, repository *ports* (Protocols)
-  infra/db/      SQLAlchemy models, repositories (adapters), outbox, DDL
+  infra/db/      SQLAlchemy models, repositories (adapters), daily-usage ledger,
+                 outbox, DDL
   container.py   Composition root — injects Clock + IdGenerator
   config.py      pydantic-settings configuration
 alembic/         Versioned, reversible migrations
-tests/           Unit + API + invariant + migration tests
+tests/           Unit + API + invariant + migration tests (SQLite + PostgreSQL)
 ```
 
 Time (`Clock`) and identifiers (`IdGenerator`) are **injectable** — production
@@ -80,16 +97,37 @@ python -m alembic downgrade -1          # roll back one migration
 python -m alembic history               # list the migration chain
 ```
 
-The migration chain is intentionally split so schema changes are **zero-downtime**:
-`0001_initial` creates the tables; `0002_active_session_guard` adds the
-single-active-session partial unique index as a purely additive step (created
-`CONCURRENTLY` on PostgreSQL in real deployments).
+The migration chain is intentionally split so schema changes are **zero-downtime**
+and every step is reversible:
+
+- `0001_initial` — creates the base tables.
+- `0002_active_session_guard` — adds the single-active-session partial unique
+  index as a purely additive step (created `CONCURRENTLY` on PostgreSQL in real
+  deployments).
+- `0003_session_birth_date` — adds `sessions.birth_date` with a server default so
+  existing rows backfill without a rewrite; old code keeps working.
+- `0004_daily_usage_ledger` — creates the authoritative `daily_usage_ledger`,
+  **folds** existing per-session daily usage into per-user totals (so consumed
+  quota is preserved across the cutover), then retires the old table.
 
 ### Tests & lint
 
 ```bash
 python -m pytest -q          # full suite (unit + API + invariants + migrations)
 python -m ruff check spe tests alembic
+```
+
+Fast unit/API tests run on SQLite. The invariants the spec requires to be proven
+on the production engine — version pinning, tenant isolation, cross-day
+settlement, process restart, concurrency, and the Alembic migrations — run
+against **real PostgreSQL** (`tests/test_pg_invariants.py`, `tests/test_migrations.py`).
+Point them at a database with `SPE_TEST_DATABASE_URL` (defaults to
+`postgresql+asyncpg://postgres:postgres@localhost:55439/spe_test`); they skip
+automatically if no database is reachable. Example with the bundled container:
+
+```bash
+export SPE_TEST_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:55439/spe_test"
+python -m pytest tests/test_pg_invariants.py tests/test_migrations.py -v
 ```
 
 ## Core endpoints
@@ -100,14 +138,14 @@ All endpoints require the `X-Tenant-ID` header.
 |---|---|
 | `POST /v1/policies/check` | Static-check a policy document without publishing. Returns issues. |
 | `POST /v1/policies` | Validate and publish a new immutable policy version. |
-| `POST /v1/policies/preview` | Dry-run the active (or a specific) policy against a hypothetical context; returns the decision + trace. |
-| `POST /v1/sessions` | Start a session (pins the active version). Supports `idempotency_key`. |
-| `POST /v1/sessions/{id}/heartbeat` | Apply a heartbeat (`seq`, `watched_seconds_total`); credits the new delta. |
+| `POST /v1/policies/preview` | Dry-run the active (or a specific) policy against a hypothetical context (`user_id`, `birth_date`, optional usage/`at`/`version`); returns the decision + trace. |
+| `POST /v1/sessions` | Start a session (pins the active version). Body: `user_id`, `birth_date`, optional `idempotency_key`. |
+| `POST /v1/sessions/{id}/heartbeat` | Apply a heartbeat (`seq`, `watched_seconds_total`); credits the budget-bounded delta. Response `extra` includes `credited_seconds` and `per_day`. |
 | `POST /v1/sessions/{id}/pause` | Pause an active session. |
 | `POST /v1/sessions/{id}/resume` | Resume a paused session. |
 | `POST /v1/sessions/{id}/end` | End a session (idempotent). |
-| `GET  /v1/sessions/{id}/usage` | Query per-day and total watch-time. |
-| `GET  /v1/sessions/{id}/replay` | Deterministically replay recorded heartbeats against the pinned policy. |
+| `GET  /v1/sessions/{id}/usage` | Query the session's total watch-time plus the authoritative daily total for the user's current local day (`extra.daily_today_seconds`). |
+| `GET  /v1/sessions/{id}/replay` | Deterministically replay recorded heartbeats against the pinned policy (dynamic age, budget truncation, per-day split). |
 | `GET  /v1/admin/health` | Liveness probe. |
 | `POST /v1/admin/outbox/relay` | Publish pending outbox events (scheduler-triggered). |
 
@@ -118,10 +156,13 @@ Session lifecycle actions return a uniform envelope:
 ```json
 {
   "ok": true,
-  "reason": "SESSION_STARTED",
-  "session": { "id": "…", "policy_version": 1, "status": "ACTIVE", "total_watched_seconds": 0, "daily": {} },
-  "trace": [ { "rule": "age_gate", "outcome": "pass", "reason": null, "detail": "age 20 ok" } ],
-  "extra": {}
+  "reason": "HEARTBEAT_APPLIED",
+  "session": {
+    "id": "…", "policy_version": 1, "status": "ACTIVE",
+    "birth_date": "2006-07-24", "total_watched_seconds": 60
+  },
+  "trace": [],
+  "extra": { "credited_seconds": 60, "per_day": { "2026-07-23": 30, "2026-07-24": 30 } }
 }
 ```
 
@@ -165,7 +206,9 @@ Rules are evaluated in a **fixed, documented order**: `age_gate → bedtime →
 daily_limit → session_limit`. The first denying rule short-circuits, unless an
 approved exception for that user waives it (recorded in the trace as `waived`).
 Bedtime windows may wrap past midnight (`start > end`), and all wall-clock rules
-use the policy `timezone`.
+use the policy `timezone`. The `age_gate` compares against an age derived from the
+session's `birth_date` and the current local date — so it is evaluated correctly
+even for sessions that span a birthday.
 
 Static checks (beyond schema validation) reject: unknown IANA timezones,
 overlapping bedtime windows, a `session_limit` greater than the `daily_limit`

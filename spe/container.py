@@ -17,6 +17,7 @@ from spe.domain.ids import IdGenerator, UuidGenerator
 from spe.domain.services.policy_service import PolicyService
 from spe.domain.services.session_service import SessionService
 from spe.infra.db.repositories.repositories import (
+    SqlDailyUsageLedger,
     SqlHeartbeatRepository,
     SqlOutboxRepository,
     SqlPolicyRepository,
@@ -33,6 +34,7 @@ class Services:
     session_service: SessionService
     heartbeats: SqlHeartbeatRepository
     policies: SqlPolicyRepository
+    ledger: SqlDailyUsageLedger
     clock: Clock
 
 
@@ -62,6 +64,7 @@ class Container:
         sessions = SqlSessionRepository(db)
         outbox = SqlOutboxRepository(db)
         heartbeats = SqlHeartbeatRepository(db)
+        ledger = SqlDailyUsageLedger(db)
         policy_service = PolicyService(policies, outbox, self.clock, self.ids)
         session_service = SessionService(
             sessions,
@@ -69,6 +72,7 @@ class Container:
             outbox,
             self.clock,
             self.ids,
+            ledger=ledger,
             heartbeats=heartbeats,
             heartbeat_max_gap_seconds=self.settings.heartbeat_max_gap_seconds,
         )
@@ -77,6 +81,7 @@ class Container:
             session_service=session_service,
             heartbeats=heartbeats,
             policies=policies,
+            ledger=ledger,
             clock=self.clock,
         )
 

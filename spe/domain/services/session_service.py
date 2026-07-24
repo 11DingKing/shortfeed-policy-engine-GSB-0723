@@ -12,21 +12,37 @@ core invariants:
   and the loser is reported with ``REJECTED_ACTIVE_SESSION_EXISTS``.
 * **Ordered, idempotent heartbeats** — each heartbeat has a sequence number and a
   cumulative watched-time marker; stale/duplicate/out-of-order beats are ignored
-  and only the positive delta is credited.
-* **Cross-midnight settlement** — credited watch-time is attributed to the local
-  day it occurred in.
+  and only the positive delta is credited. Heartbeats take a row lock so
+  concurrent beats for one session serialise.
+* **Authoritative daily ledger** — daily usage lives in a per-(tenant, user,
+  local-day) ledger, not the session, so restarting a session never resets a
+  user's daily quota.
+* **Budget-truncated crediting** — the credited delta is clamped to what remains
+  of both the session limit and the daily limit *before* it is written, so usage
+  is never over-recorded and then rolled back.
+* **Precise cross-midnight split** — a delta that straddles local midnight is
+  divided between the two local days to the second.
+* **Dynamic age** — the user's age is derived from their birth date and the
+  current local date at evaluation time; nothing is hard-coded.
 
-The service is transport-agnostic and depends only on domain ports.
+The service is transport-agnostic and depends only on domain ports. All writes
+in a single call happen in one unit of work (one DB transaction), so the session
+mutation, ledger increment, heartbeat record, idempotency key and outbox event
+commit atomically.
 """
 
 from __future__ import annotations
 
+from datetime import date, datetime
+
 from spe.domain.clock import Clock
 from spe.domain.events import DomainEvent
 from spe.domain.ids import IdGenerator
+from spe.domain.policy_ast import PolicyDocument
 from spe.domain.policy_interpreter import EvalContext, evaluate
 from spe.domain.reason_codes import ReasonCode
 from spe.domain.repositories import (
+    DailyUsageLedger,
     HeartbeatSink,
     OutboxRepository,
     PolicyRepository,
@@ -34,7 +50,7 @@ from spe.domain.repositories import (
 )
 from spe.domain.services.responses import ActionResult
 from spe.domain.session import Session, SessionStatus
-from spe.domain.timeutil import local_day_key
+from spe.domain.timeutil import age_at, local_day_key, split_watch_window
 
 
 class ActiveSessionExists(Exception):
@@ -51,6 +67,7 @@ class SessionService:
         outbox: OutboxRepository,
         clock: Clock,
         ids: IdGenerator,
+        ledger: DailyUsageLedger,
         heartbeats: HeartbeatSink | None = None,
         heartbeat_max_gap_seconds: int = 90,
     ) -> None:
@@ -59,6 +76,7 @@ class SessionService:
         self._outbox = outbox
         self._clock = clock
         self._ids = ids
+        self._ledger = ledger
         self._heartbeats = heartbeats
         self._max_gap = heartbeat_max_gap_seconds
 
@@ -68,7 +86,7 @@ class SessionService:
         self,
         tenant_id: str,
         user_id: str,
-        user_age: int,
+        birth_date: date,
         idempotency_key: str | None = None,
     ) -> ActionResult:
         """Start a new session, pinned to the tenant's active policy version."""
@@ -84,12 +102,16 @@ class SessionService:
             return ActionResult.rejected(ReasonCode.REJECTED_POLICY_NOT_FOUND)
 
         now = self._clock.now()
-        # Evaluate eligibility at start (age + bedtime; no usage yet).
+        tz = policy.document.rules.timezone
+        # Evaluate eligibility at start against the authoritative daily ledger
+        # (age + bedtime + already-consumed daily budget; no session usage yet).
+        local_day = local_day_key(now, tz)
+        daily_used = await self._ledger.get_seconds(tenant_id, user_id, local_day)
         ctx = EvalContext(
             now=now,
             user_id=user_id,
-            user_age=user_age,
-            daily_usage_seconds=0,
+            user_age=age_at(birth_date, now, tz),
+            daily_usage_seconds=daily_used,
             session_elapsed_seconds=0,
         )
         decision = evaluate(policy.document, ctx)
@@ -103,11 +125,12 @@ class SessionService:
             policy_id=policy.id,
             policy_version=policy.version,
             status=SessionStatus.ACTIVE,
+            birth_date=birth_date,
             started_at=now,
             updated_at=now,
         )
         try:
-            await self._sessions.add(session)
+            await self._sessions.add(session, idempotency_key=idempotency_key)
         except ActiveSessionExists:
             # Lost a concurrent race: another start committed first.
             current = await self._sessions.get_active_for_user(tenant_id, user_id)
@@ -115,15 +138,7 @@ class SessionService:
                 ReasonCode.REJECTED_ACTIVE_SESSION_EXISTS, session=current
             )
 
-        if idempotency_key is not None:
-            await self._sessions.save(session, idempotency_key=idempotency_key)
-
-        await self._emit(
-            "session.started",
-            session,
-            now,
-            version=session.policy_version,
-        )
+        await self._emit("session.started", session, now, version=session.policy_version)
         return ActionResult.success(
             ReasonCode.SESSION_STARTED, session=session, trace=decision.trace
         )
@@ -137,15 +152,16 @@ class SessionService:
         seq: int,
         watched_seconds_total: int,
     ) -> ActionResult:
-        """Apply a heartbeat, crediting only the new, in-order watch-time delta.
+        """Apply a heartbeat, crediting only the new, in-order, budget-bounded delta.
 
         ``seq`` is a per-session monotonically increasing counter; ``watched_
         seconds_total`` is the client's cumulative watched-time marker. Duplicate
-        or out-of-order beats (``seq <= last_seq``) are ignored. The credited
-        delta is the growth of the cumulative marker, clamped to the configured
-        maximum gap to bound the effect of client silence.
+        or out-of-order beats (``seq <= last_seq``) are ignored. The proposed
+        delta (growth of the cumulative marker, clamped to the max gap) is split
+        across any local-midnight boundary and then truncated to what remains of
+        both the session and daily limits, so nothing is ever over-credited.
         """
-        session = await self._sessions.get(tenant_id, session_id)
+        session = await self._sessions.get_for_update(tenant_id, session_id)
         if session is None:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_FOUND)
         if session.status is SessionStatus.ENDED:
@@ -163,14 +179,21 @@ class SessionService:
             )
 
         now = self._clock.now()
-        raw_delta = watched_seconds_total - session.watched_seconds_marker
-        delta = max(0, min(raw_delta, self._max_gap))
+        policy = await self._policies.get_by_id(tenant_id, session.policy_id)
+        assert policy is not None  # pinned policy must exist
+        tz = policy.document.rules.timezone
 
-        local_day = local_day_key(now, await self._policy_timezone(session))
-        session.add_usage(local_day, delta)
-        session.watched_seconds_marker = max(
-            session.watched_seconds_marker, watched_seconds_total
+        proposed = max(
+            0, min(watched_seconds_total - session.watched_seconds_marker, self._max_gap)
         )
+
+        credited, per_day, hit_limit, limit_reason = await self._credit(
+            session, policy.document, tz, now, proposed
+        )
+
+        # Advance the marker/seq regardless of how much was creditable, so the
+        # cumulative accounting stays monotonic and idempotent.
+        session.watched_seconds_marker = max(session.watched_seconds_marker, watched_seconds_total)
         session.last_seq = seq
         session.updated_at = now
 
@@ -180,53 +203,96 @@ class SessionService:
                 session_id=session_id,
                 seq=seq,
                 watched_seconds_total=watched_seconds_total,
-                credited_seconds=delta,
+                credited_seconds=credited,
                 occurred_at=now,
             )
 
-        # Re-evaluate hard limits against the pinned policy after crediting.
-        policy = await self._policies.get_by_id(tenant_id, session.policy_id)
-        assert policy is not None  # pinned policy must exist
-        ctx = EvalContext(
-            now=now,
-            user_id=session.user_id,
-            user_age=130,  # age already cleared at start; not re-checked here
-            daily_usage_seconds=session.daily_seconds(local_day),
-            session_elapsed_seconds=session.total_watched_seconds,
-        )
-        decision = evaluate(policy.document, ctx)
-
-        if not decision.allowed:
-            # A hard usage/time limit was hit: finalise the session now.
+        if hit_limit:
             session.status = SessionStatus.ENDED
             session.ended_at = now
             await self._sessions.save(session)
-            await self._emit(
-                "session.ended",
-                session,
-                now,
-                cause=decision.reason.value,
-            )
+            await self._emit("session.ended", session, now, cause=limit_reason)
             return ActionResult.rejected(
                 ReasonCode.SESSION_ENDED_BY_LIMIT,
                 session=session,
-                trace=decision.trace,
-                limit_reason=decision.reason.value,
+                credited_seconds=credited,
+                per_day=per_day,
+                limit_reason=limit_reason,
             )
 
         await self._sessions.save(session)
-        await self._emit("session.heartbeat", session, now, credited_seconds=delta)
+        await self._emit("session.heartbeat", session, now, credited_seconds=credited)
         return ActionResult.success(
             ReasonCode.HEARTBEAT_APPLIED,
             session=session,
-            trace=decision.trace,
-            credited_seconds=delta,
+            credited_seconds=credited,
+            per_day=per_day,
         )
+
+    async def _credit(
+        self,
+        session: Session,
+        document: PolicyDocument,
+        timezone: str,
+        now: datetime,
+        proposed: int,
+    ) -> tuple[int, dict[str, int], bool, str | None]:
+        """Credit up to ``proposed`` seconds, bounded by session & daily budgets.
+
+        Returns ``(credited, per_day_breakdown, hit_limit, limit_reason)``. The
+        interval is split across local midnight and each segment is truncated to
+        the remaining session budget and that day's remaining daily budget before
+        being written to the ledger and the session total.
+        """
+        session_cap = (
+            document.rules.session_limit.max_seconds
+            if document.rules.session_limit
+            else None
+        )
+        daily_cap = (
+            document.rules.daily_limit.max_seconds if document.rules.daily_limit else None
+        )
+
+        credited = 0
+        per_day: dict[str, int] = {}
+        hit_limit = False
+        limit_reason: str | None = None
+
+        for day, segment_seconds in split_watch_window(now, proposed, timezone):
+            allow = segment_seconds
+
+            # Bound by remaining session budget.
+            if session_cap is not None:
+                session_remaining = session_cap - session.total_watched_seconds
+                if allow >= session_remaining:
+                    allow = max(0, session_remaining)
+                    hit_limit = True
+                    limit_reason = ReasonCode.DENIED_SESSION_LIMIT_REACHED.value
+
+            # Bound by remaining daily budget for this specific local day.
+            if daily_cap is not None:
+                already = await self._ledger.get_seconds(session.tenant_id, session.user_id, day)
+                day_remaining = daily_cap - (already + per_day.get(day, 0))
+                if allow >= day_remaining:
+                    allow = max(0, day_remaining)
+                    hit_limit = True
+                    limit_reason = ReasonCode.DENIED_DAILY_LIMIT_REACHED.value
+
+            if allow > 0:
+                await self._ledger.add_seconds(session.tenant_id, session.user_id, day, allow)
+                session.total_watched_seconds += allow
+                credited += allow
+                per_day[day] = per_day.get(day, 0) + allow
+
+            if hit_limit:
+                break
+
+        return credited, per_day, hit_limit, limit_reason
 
     # -- pause / resume ------------------------------------------------------
 
     async def pause(self, tenant_id: str, session_id: str) -> ActionResult:
-        session = await self._sessions.get(tenant_id, session_id)
+        session = await self._sessions.get_for_update(tenant_id, session_id)
         if session is None:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_FOUND)
         if session.status is SessionStatus.ENDED:
@@ -242,7 +308,7 @@ class SessionService:
         return ActionResult.success(ReasonCode.SESSION_PAUSED, session=session)
 
     async def resume(self, tenant_id: str, session_id: str) -> ActionResult:
-        session = await self._sessions.get(tenant_id, session_id)
+        session = await self._sessions.get_for_update(tenant_id, session_id)
         if session is None:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_FOUND)
         if session.status is SessionStatus.ENDED:
@@ -260,7 +326,7 @@ class SessionService:
     # -- end -----------------------------------------------------------------
 
     async def end(self, tenant_id: str, session_id: str) -> ActionResult:
-        session = await self._sessions.get(tenant_id, session_id)
+        session = await self._sessions.get_for_update(tenant_id, session_id)
         if session is None:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_FOUND)
         if session.status is SessionStatus.ENDED:
@@ -281,14 +347,17 @@ class SessionService:
         session = await self._sessions.get(tenant_id, session_id)
         if session is None:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_FOUND)
-        return ActionResult.success(ReasonCode.ALLOWED, session=session)
+        # Report the authoritative daily total for the session's current local day.
+        policy = await self._policies.get_by_id(tenant_id, session.policy_id)
+        daily_today = 0
+        if policy is not None:
+            day = local_day_key(self._clock.now(), policy.document.rules.timezone)
+            daily_today = await self._ledger.get_seconds(tenant_id, session.user_id, day)
+        return ActionResult.success(
+            ReasonCode.ALLOWED, session=session, daily_today_seconds=daily_today
+        )
 
     # -- helpers -------------------------------------------------------------
-
-    async def _policy_timezone(self, session: Session) -> str:
-        policy = await self._policies.get_by_id(session.tenant_id, session.policy_id)
-        assert policy is not None
-        return policy.document.rules.timezone
 
     async def _emit(self, event_type: str, session: Session, now, **payload) -> None:
         await self._outbox.add(

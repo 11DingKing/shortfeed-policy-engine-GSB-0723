@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import headers, sample_policy
+from tests.conftest import birth_for_age, headers, sample_policy
 
 pytestmark = pytest.mark.asyncio
 
@@ -16,10 +16,10 @@ async def _publish(client, **kw) -> None:
     assert resp.status_code == 201
 
 
-async def _start(client, user_id: str = "u1", user_age: int = 20, **kw):
+async def _start(client, user_id: str = "u1", age: int = 20, **kw):
     return await client.post(
         "/v1/sessions",
-        json={"user_id": user_id, "user_age": user_age, **kw},
+        json={"user_id": user_id, "birth_date": birth_for_age(age).isoformat(), **kw},
         headers=headers(),
     )
 
@@ -42,7 +42,7 @@ async def test_start_without_policy_404(client) -> None:
 
 async def test_start_denied_under_age(client) -> None:
     await _publish(client, min_age=18)
-    resp = await _start(client, user_age=15)
+    resp = await _start(client, age=15)
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is False

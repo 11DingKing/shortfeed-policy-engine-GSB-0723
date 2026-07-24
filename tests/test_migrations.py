@@ -31,6 +31,12 @@ from tests.conftest import PG_URL
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Revision ids of the expand / backfill / cutover / contract chain.
+REV_BASE = "0003_session_birth_date"
+REV_EXPAND = "0004_expand_ledger"
+REV_BACKFILL = "0005_backfill_ledger"
+REV_CONTRACT = "0006_contract_sdu"
+
 
 async def _pg_reachable(url: str) -> bool:
     try:
@@ -115,15 +121,68 @@ def test_upgrade_head_creates_ledger_schema(migration_db) -> None:
     command.upgrade(cfg, "head")
     tables = asyncio.run(_tables(url))
     assert {"policies", "sessions", "heartbeats", "outbox", "daily_usage_ledger"} <= tables
-    # The old per-session usage table has been retired by migration 0004.
+    # The old per-session usage table is retired only by the final contract phase.
     assert "session_daily_usage" not in tables
+
+
+def test_expand_and_backfill_keep_both_tables_for_rolling_deploy(migration_db) -> None:
+    """During expand+backfill both tables coexist, so a rolling deploy is safe.
+
+    This is the core property of expand / backfill / cutover / contract: no
+    service process ever hits a missing table. Old processes keep reading the
+    per-session table; new processes read the already-populated ledger; only the
+    later contract migration drops the old table.
+    """
+    cfg, url = migration_db
+
+    # Pre-ledger schema with seeded per-session usage.
+    command.upgrade(cfg, REV_BASE)
+    asyncio.run(_seed_0003(url))
+
+    # Expand: ledger table now exists; the old table is untouched and still present.
+    command.upgrade(cfg, REV_EXPAND)
+    tables = asyncio.run(_tables(url))
+    assert "session_daily_usage" in tables  # old code path still works
+    assert "daily_usage_ledger" in tables  # new code path can already read it
+    # Backfill has not run yet, so the ledger is empty (new writes converge later).
+    assert asyncio.run(_ledger_totals(url)) == {}
+
+    # Backfill: ledger is populated; the old table STILL exists (cutover pending).
+    command.upgrade(cfg, REV_BACKFILL)
+    tables = asyncio.run(_tables(url))
+    assert "session_daily_usage" in tables
+    assert "daily_usage_ledger" in tables
+    # Both representations now report the same authoritative totals.
+    assert asyncio.run(_legacy_totals(url)) == _EXPECTED_LEDGER
+    assert asyncio.run(_ledger_totals(url)) == _EXPECTED_LEDGER
+
+    # Contract: only after cutover is the old table finally dropped.
+    command.upgrade(cfg, REV_CONTRACT)
+    tables = asyncio.run(_tables(url))
+    assert "session_daily_usage" not in tables
+    assert asyncio.run(_ledger_totals(url)) == _EXPECTED_LEDGER
+
+
+def test_backfill_is_idempotent(migration_db) -> None:
+    """Re-running backfill (or running it after cutover writes) must not double-count."""
+    cfg, url = migration_db
+    command.upgrade(cfg, REV_BASE)
+    asyncio.run(_seed_0003(url))
+    command.upgrade(cfg, REV_BACKFILL)
+    assert asyncio.run(_ledger_totals(url)) == _EXPECTED_LEDGER
+
+    # Roll backfill back and forward again; totals must be identical, not doubled.
+    command.downgrade(cfg, REV_EXPAND)
+    assert asyncio.run(_ledger_totals(url)) == {}
+    command.upgrade(cfg, REV_BACKFILL)
+    assert asyncio.run(_ledger_totals(url)) == _EXPECTED_LEDGER
 
 
 def test_ledger_migration_preserves_consumed_quota(migration_db) -> None:
     cfg, url = migration_db
 
-    # Upgrade to just before the ledger migration (old schema still present).
-    command.upgrade(cfg, "0003_session_birth_date")
+    # Upgrade to just before the ledger exists (old schema still present).
+    command.upgrade(cfg, REV_BASE)
 
     async def seed() -> None:
         engine = create_async_engine(url)
@@ -164,8 +223,8 @@ def test_ledger_migration_preserves_consumed_quota(migration_db) -> None:
         return value
 
     asyncio.run(seed())
-    # Apply the ledger migration synchronously (folds usage into the per-user ledger).
-    command.upgrade(cfg, "0004_daily_usage_ledger")
+    # Expand + backfill fold usage into the per-user ledger.
+    command.upgrade(cfg, REV_BACKFILL)
     # 40 + 30 summed into one authoritative per-user ledger row.
     assert asyncio.run(read_total()) == 70
 
@@ -291,21 +350,23 @@ async def _add_new_usage(url: str, tenant: str, user: str, day: str, secs: int) 
 
 
 def test_ledger_roundtrip_preserves_usage_with_data(migration_db) -> None:
-    """0003 -> 0004 -> 0003 -> 0004 with realistic data must never drop or double-count.
+    """base -> head -> base -> head with realistic data must never drop or double-count.
 
-    Covers multiple historical sessions per user, multiple dates, multiple tenants
-    (including the same user id across tenants), new usage added after the first
-    upgrade, and a repeated upgrade/rollback cycle.
+    Exercises the full expand/backfill/cutover/contract chain and its reverse
+    (contract -> backfill -> expand -> base) with realistic data: multiple
+    historical sessions per user, multiple dates, multiple tenants (including the
+    same user id across tenants), new usage added after the first upgrade, and a
+    repeated upgrade/rollback cycle.
     """
     cfg, url = migration_db
 
-    # Seed under the 0003 (pre-ledger) schema and confirm the old code path reads it.
-    command.upgrade(cfg, "0003_session_birth_date")
+    # Seed under the pre-ledger schema and confirm the old code path reads it.
+    command.upgrade(cfg, REV_BASE)
     asyncio.run(_seed_0003(url))
     assert asyncio.run(_legacy_totals(url)) == _EXPECTED_LEDGER
 
-    # Forward: fold into the authoritative per-user ledger.
-    command.upgrade(cfg, "0004_daily_usage_ledger")
+    # Forward through the whole chain: ledger becomes the authoritative source.
+    command.upgrade(cfg, "head")
     assert asyncio.run(_ledger_totals(url)) == _EXPECTED_LEDGER
 
     # New-code writes more usage after the cutover (existing day + a brand new day).
@@ -316,15 +377,16 @@ def test_ledger_roundtrip_preserves_usage_with_data(migration_db) -> None:
     after_new[("t1", "u1", "2026-07-25")] = 30
     assert asyncio.run(_ledger_totals(url)) == after_new
 
-    # Rollback: 0004 -> 0003 must retain consumed quota for the old code path.
-    command.downgrade(cfg, "0003_session_birth_date")
+    # Rollback the whole chain: the old per-session table is restored and retains
+    # the consumed quota (contract downgrade folds the ledger back into it).
+    command.downgrade(cfg, REV_BASE)
     assert asyncio.run(_legacy_totals(url)) == after_new
 
-    # Re-upgrade: 0003 -> 0004 again must reproduce exactly (no loss, no doubling).
-    command.upgrade(cfg, "0004_daily_usage_ledger")
+    # Re-upgrade: reproduce the ledger exactly (no loss, no doubling).
+    command.upgrade(cfg, "head")
     assert asyncio.run(_ledger_totals(url)) == after_new
 
     # A second full cycle stays stable.
-    command.downgrade(cfg, "0003_session_birth_date")
-    command.upgrade(cfg, "0004_daily_usage_ledger")
+    command.downgrade(cfg, REV_BASE)
+    command.upgrade(cfg, "head")
     assert asyncio.run(_ledger_totals(url)) == after_new

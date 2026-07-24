@@ -106,14 +106,28 @@ and every step is reversible:
   deployments).
 - `0003_session_birth_date` — adds `sessions.birth_date` with a server default so
   existing rows backfill without a rewrite; old code keeps working.
-- `0004_daily_usage_ledger` — creates the authoritative `daily_usage_ledger`,
-  **folds** existing per-session daily usage into per-user totals (so consumed
-  quota is preserved across the cutover), then retires the old table. Its
-  **downgrade is data-preserving**: the ledger totals are written back into a
-  freshly recreated `session_daily_usage` (attributed to each user's most recent
-  session), so rolling `0004 → 0003` keeps consumed quota readable by old code,
-  and `0003 → 0004` re-derives the identical ledger — no loss, no double-count
-  across repeated cycles (covered by a real-Postgres round-trip test).
+
+The move from the per-session `session_daily_usage` table to the authoritative
+per-user `daily_usage_ledger` follows the **expand / backfill / cutover /
+contract** pattern so a rolling deploy never sees a missing table:
+
+- `0004_expand_ledger` — **expand**: *adds* `daily_usage_ledger` and leaves
+  `session_daily_usage` fully intact. Both tables now coexist; old processes keep
+  using the old table, new processes can already read the ledger.
+- `0005_backfill_ledger` — **backfill**: folds existing per-session usage into the
+  ledger via an idempotent upsert (recomputes the authoritative sum, so re-runs or
+  concurrent cutover writes converge rather than double-count). The old table is
+  still present.
+- **cutover** (no migration): deploy the new service version fleet-wide. Now every
+  process reads/writes `daily_usage_ledger`; nothing references the old table.
+- `0006_contract_sdu` — **contract**: only now drops `session_daily_usage`. Its
+  downgrade recreates the table and folds the ledger totals back into it
+  (attributed to each user's most recent session), so rolling back to the
+  expand/backfill state keeps consumed quota readable by old code.
+
+The whole chain is reversible and data-preserving: `base → head → base → head`
+with real data neither drops nor double-counts usage (covered by real-Postgres
+round-trip, coexistence and idempotency tests).
 
 ### Tests & lint
 
